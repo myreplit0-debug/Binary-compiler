@@ -20,7 +20,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
       - uses: arduino/setup-arduino-cli@v1
 
       - name: deps
@@ -30,54 +29,56 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq zip
 
+      # --- compile and EXPORT build dir as an output ---
       - name: compile ${{ matrix.t.name }}
+        id: build
         env:
           FQBN:   ${{ matrix.t.fqbn }}
           SKETCH: ${{ matrix.t.sketch }}
         run: |
           set -e
-          # build + export
           arduino-cli compile --fqbn "$FQBN" --export-binaries "$SKETCH"
-          # get the build.path (folder with .bin files)
-          BUILD=$(arduino-cli compile --fqbn "$FQBN" --show-properties "$SKETCH" \
-                  | sed -n 's/^build.path=//p' | tail -n1)
-          echo "BUILD=$BUILD" >> "$GITHUB_ENV"
-          echo "Build dir: $BUILD"
+          BUILD=$(arduino-cli compile --fqbn "$FQBN" --show-properties "$SKETCH" | sed -n 's/^build.path=//p' | tail -n1)
+          echo "build_dir=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "Built in: $BUILD"
           ls -la "$BUILD" || true
 
+      # --- bundle using the build dir from previous step ---
       - name: bundle ${{ matrix.t.name }}
         env:
-          NAME: ${{ matrix.t.name }}
+          NAME:  ${{ matrix.t.name }}
+          BUILD: ${{ steps.build.outputs.build_dir }}
         run: |
           set -e
+          echo "Using BUILD=$BUILD"
+          test -d "$BUILD"
+
           mkdir -p out/$NAME
 
-          # locate files produced by ESP32 core
-          APP=$(find "$BUILD" -maxdepth 2 -type f -name '*.ino.bin' -print -quit)
-          PART=$(find "$BUILD" -maxdepth 2 -type f -name '*partitions.bin' -print -quit)
-          BOOT=$(find "$BUILD" -maxdepth 2 -type f -name 'bootloader*.bin' -print -quit)
+          APP=$(find "$BUILD" -maxdepth 2 -type f -name '*.ino.bin'        -print -quit)
+          PART=$(find "$BUILD" -maxdepth 2 -type f -name '*partitions.bin'  -print -quit)
+          BOOT=$(find "$BUILD" -maxdepth 2 -type f -name 'bootloader*.bin'  -print -quit)
+          echo "APP=$APP"; echo "PART=$PART"; echo "BOOT=$BOOT"
 
-          echo "APP=$APP"
-          echo "PART=$PART"
-          echo "BOOT=$BOOT"
-
-          if [ -z "$APP" ]; then echo "ERROR: app *.ino.bin not found"; ls -R "$BUILD"; exit 1; fi
-          if [ -z "$PART" ]; then echo "ERROR: *partitions.bin not found"; ls -R "$BUILD"; exit 1; fi
-          if [ -z "$BOOT" ]; then echo "ERROR: bootloader*.bin not found"; ls -R "$BUILD"; exit 1; fi
+          : ${APP:?app *.ino.bin not found}
+          : ${PART:?*partitions.bin not found}
+          : ${BOOT:?bootloader*.bin not found}
 
           cp "$APP"  out/$NAME/firmware.bin
           cp "$PART" out/$NAME/partitions.bin
           cp "$BOOT" out/$NAME/bootloader.bin
 
-          # boot_app0 from the core install
           CORE=$(arduino-cli core list --format json | jq -r '.installed[]|select(.name|contains("esp32"))|.install_dir' | head -n1)
           APP0=$(find "$CORE" -type f -name 'boot_app0.bin' -print -quit)
-          if [ -z "$APP0" ]; then echo "ERROR: boot_app0.bin not found in core"; exit 1; fi
+          : ${APP0:?boot_app0.bin not found in core}
           cp "$APP0" out/$NAME/boot_app0.bin
 
-          # offsets (text file)
-          printf "bootloader.bin  0x0000\npartitions.bin  0x8000\nboot_app0.bin   0xE000\nfirmware.bin    0x10000\n" \
-            > out/$NAME/flash_offsets.txt
+          cat > out/$NAME/flash_offsets.txt <<'OFF'
+bootloader.bin  0x0000
+partitions.bin  0x8000
+boot_app0.bin   0xE000
+firmware.bin    0x10000
+OFF
 
           (cd out/$NAME && zip -9 ../${NAME}_bins.zip bootloader.bin partitions.bin boot_app0.bin firmware.bin flash_offsets.txt)
 
