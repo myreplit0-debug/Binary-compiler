@@ -29,7 +29,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq zip
 
-      # compile and export the build directory path
       - name: compile ${{ matrix.t.name }}
         id: build
         env:
@@ -43,11 +42,11 @@ jobs:
           echo "Built in: $BUILD"
           ls -la "$BUILD" || true
 
-      # bundle four .bin files + offsets text
       - name: bundle ${{ matrix.t.name }}
         env:
           NAME:  ${{ matrix.t.name }}
           BUILD: ${{ steps.build.outputs.build_dir }}
+          FQBN:  ${{ matrix.t.fqbn }}
         run: |
           set -e
           echo "Using BUILD=$BUILD"
@@ -55,21 +54,39 @@ jobs:
 
           mkdir -p out/$NAME
 
+          # build outputs
           APP=$(find "$BUILD" -maxdepth 2 -type f -name '*.ino.bin'       -print -quit)
           PART=$(find "$BUILD" -maxdepth 2 -type f -name '*partitions.bin' -print -quit)
-          BOOT=$(find "$BUILD" -maxdepth 2 -type f -name 'bootloader*.bin' -print -quit)
+          BOOT=$(find "$BUILD" -maxdepth 3 -type f -name 'bootloader*.bin' -print -quit || true)
 
-          : ${APP:?app *.ino.bin not found}
-          : ${PART:?*partitions.bin not found}
-          : ${BOOT:?bootloader*.bin not found}
+          if [ -z "$APP" ] || [ -z "$PART" ]; then
+            echo "Build outputs missing:"
+            ls -R "$BUILD"
+            exit 1
+          fi
+
+          # core install dir
+          CORE=$(arduino-cli core list --format json | jq -r '.installed[]|select(.name|contains("esp32"))|.install_dir' | head -n1)
+
+          # prebuilt bootloader (core 3.x keeps it under tools/*/bin)
+          if [ -z "$BOOT" ]; then
+            FAMILY=$(echo "$FQBN" | awk -F: '{print $3}')
+            if [ "$FAMILY" = "esp32s3" ]; then
+              BOOT=$(find "$CORE/tools" -type f -path '*/esp32s3/bin/*' -name 'bootloader*.bin' -print -quit)
+            else
+              BOOT=$(find "$CORE/tools" -type f -path '*/esp32/bin/*'   -name 'bootloader*.bin' -print -quit)
+            fi
+          fi
+
+          APP0=$(find "$CORE/tools" -type f -path '*/esp32s3/bin/*' -name 'boot_app0.bin' -print -quit)
+          if [ -z "$APP0" ]; then APP0=$(find "$CORE" -type f -name 'boot_app0.bin' -print -quit); fi
+
+          : ${BOOT:?bootloader.bin not found}
+          : ${APP0:?boot_app0.bin not found}
 
           cp "$APP"  out/$NAME/firmware.bin
           cp "$PART" out/$NAME/partitions.bin
           cp "$BOOT" out/$NAME/bootloader.bin
-
-          CORE=$(arduino-cli core list --format json | jq -r '.installed[]|select(.name|contains("esp32"))|.install_dir' | head -n1)
-          APP0=$(find "$CORE" -type f -name 'boot_app0.bin' -print -quit)
-          : ${APP0:?boot_app0.bin not found in core}
           cp "$APP0" out/$NAME/boot_app0.bin
 
           printf '%s\n%s\n%s\n%s\n' \
