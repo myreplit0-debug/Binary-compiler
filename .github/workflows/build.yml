@@ -14,22 +14,13 @@ jobs:
       fail-fast: false
       matrix:
         t:
-          - name: ui
-            sketch: ui_web_s3_ap/ui_web_s3_ap.ino
-            fqbn: esp32:esp32:esp32s3
-          - name: smoke
-            sketch: smoke_chain_s3/smoke_chain_s3.ino
-            fqbn: esp32:esp32:esp32s3
-          - name: ice
-            sketch: ice_ble_uart/ice_ble_uart.ino
-            fqbn: esp32:esp32:esp32
+          - { name: ui,    sketch: ui_web_s3_ap/ui_web_s3_ap.ino,     fqbn: "esp32:esp32:esp32s3" }
+          - { name: smoke, sketch: smoke_chain_s3/smoke_chain_s3.ino, fqbn: "esp32:esp32:esp32s3" }
+          - { name: ice,   sketch: ice_ble_uart/ice_ble_uart.ino,     fqbn: "esp32:esp32:esp32" }
 
     steps:
-      - name: checkout
-        uses: actions/checkout@v4
-
-      - name: setup arduino-cli
-        uses: arduino/setup-arduino-cli@v1
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v1
 
       - name: deps
         run: |
@@ -63,26 +54,26 @@ jobs:
 
           mkdir -p out/$NAME
 
-          # build outputs
-          APP=$(find "$BUILD" -maxdepth 2 -type f -name '*.ino.bin'        -print -quit)
-          PART=$(find "$BUILD" -maxdepth 2 -type f -name '*partitions.bin'  -print -quit)
-          BOOT=$(find "$BUILD" -maxdepth 3 -type f -name 'bootloader*.bin'  -print -quit || true)
+          # ---- build outputs (from compile dir)
+          APP=$(find "$BUILD" -maxdepth 2 -type f -name '*.ino.bin'         -print -quit)
+          PART=$(find "$BUILD" -maxdepth 2 -type f -name '*partitions.bin'   -print -quit)
+          # match either "<sketch>.ino.bootloader.bin" or "bootloader*.bin"
+          BOOT=$(find "$BUILD" -maxdepth 2 -type f \( -name '*.bootloader.bin' -o -name 'bootloader*.bin' \) -print -quit || true)
 
           if [ -z "$APP" ] || [ -z "$PART" ]; then
-            echo "Build outputs missing; tree follows:"
-            ls -R "$BUILD"
-            exit 1
+            echo "Build outputs missing; tree follows:"; ls -R "$BUILD"; exit 1
           fi
 
-          # locate ESP32 core dir robustly
+          # ---- locate core install dir robustly
           DATA_DIR=$(arduino-cli config dump --format json | jq -r '.directories.data')
           HW_BASE="$DATA_DIR/packages/esp32/hardware/esp32"
           CORE_VER=$(ls -1 "$HW_BASE" | sort -V | tail -n1)
           CORE="$HW_BASE/$CORE_VER"
           echo "Core dir: $CORE"
 
-          FAMILY=$(echo "$FQBN" | awk -F: '{print $3}')
+          # ---- get bootloader if not in build dir
           if [ -z "$BOOT" ]; then
+            FAMILY=$(echo "$FQBN" | awk -F: '{print $3}')
             if [ "$FAMILY" = "esp32s3" ]; then
               BOOT=$(find "$CORE/tools" -type f -path '*/esp32s3/bin/*' -name 'bootloader*.bin' -print -quit)
             else
@@ -90,7 +81,8 @@ jobs:
             fi
           fi
 
-          # boot_app0
+          # ---- boot_app0 (tools or core)
+          FAMILY=$(echo "$FQBN" | awk -F: '{print $3}')
           if [ "$FAMILY" = "esp32s3" ]; then
             APP0=$(find "$CORE/tools" -type f -path '*/esp32s3/bin/*' -name 'boot_app0.bin' -print -quit)
           else
@@ -106,7 +98,6 @@ jobs:
           cp "$BOOT" out/$NAME/bootloader.bin
           cp "$APP0" out/$NAME/boot_app0.bin
 
-          # offsets file (avoid heredoc YAML issues)
           printf '%s\n%s\n%s\n%s\n' \
             'bootloader.bin  0x0000' \
             'partitions.bin  0x8000' \
@@ -116,8 +107,8 @@ jobs:
 
           (cd out/$NAME && zip -9 ../${NAME}_bins.zip bootloader.bin partitions.bin boot_app0.bin firmware.bin flash_offsets.txt)
 
-      - name: upload
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.t.name }}_bins
           path: out/${{ matrix.t.name }}/*
+```0
