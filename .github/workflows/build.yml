@@ -2,7 +2,9 @@ name: build
 
 on:
   push:
-    paths: ["**/*.ino", ".github/workflows/build.yml"]
+    paths:
+      - "**/*.ino"
+      - ".github/workflows/build.yml"
   workflow_dispatch:
 
 jobs:
@@ -12,32 +14,34 @@ jobs:
       fail-fast: false
       matrix:
         t:
-          # UI — ESP32-S3 N16R8 (16MB flash, 8MB PSRAM), huge HTML page
-          - {name: ui,    sketch: ui/ui.ino,    fqbn: "esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=default,FlashSize=16M,PartitionScheme=huge_app,PSRAM=opi,UploadSpeed=921600"}
-          # SMOKE — ESP32-S3 (adjust FlashSize if yours are 8M)
-          - {name: smoke, sketch: smoke/smoke.ino, fqbn: "esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=default,FlashSize=16M,PartitionScheme=default,PSRAM=opi,UploadSpeed=921600"}
-          # ICE — classic ESP32 DevKit v1
-          - {name: ice,   sketch: ice/ice.ino,   fqbn: "esp32:esp32:esp32:FlashFreq=80,FlashSize=4M,PartitionScheme=default,UploadSpeed=921600"}
+          # Keep the file/folder names exactly as below
+          - { name: ui,    sketch: ui_web_s3_ap/ui_web_s3_ap.ino,       fqbn: "esp32:esp32:esp32s3" }
+          - { name: smoke, sketch: smoke_chain_s3/smoke_chain_s3.ino,   fqbn: "esp32:esp32:esp32s3" }
+          - { name: ice,   sketch: ice_ble_uart/ice_ble_uart.ino,       fqbn: "esp32:esp32:esp32" }
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: arduino/setup-arduino-cli@v1
-      - name: install esp32 core
+
+      - name: deps
         run: |
           arduino-cli core update-index
           arduino-cli core install esp32:esp32
+          sudo apt-get update
+          sudo apt-get install -y jq zip
 
       - name: compile ${{ matrix.t.name }}
         env:
-          FQBN: ${{ matrix.t.fqbn }}
+          FQBN:   ${{ matrix.t.fqbn }}
           SKETCH: ${{ matrix.t.sketch }}
         run: |
           set -e
           arduino-cli compile --fqbn "$FQBN" --export-binaries "$SKETCH"
-          BUILD=$(arduino-cli compile --fqbn "$FQBN" --show-properties "$SKETCH" | grep '^build.path=' | cut -d= -f2-)
-          echo "BUILD=$BUILD" >> $GITHUB_ENV
+          BUILD=$(arduino-cli compile --fqbn "$FQBN" --show-properties "$SKETCH" | awk -F= '/^build.path=/{print $2; exit}')
+          echo "BUILD=$BUILD" >> "$GITHUB_ENV"
 
-      - name: bundle 4-bin set (${{ matrix.t.name }})
+      - name: bundle ${{ matrix.t.name }}
         env:
           NAME: ${{ matrix.t.name }}
         run: |
@@ -45,25 +49,19 @@ jobs:
           mkdir -p out/$NAME
           cp "$BUILD"/*.bin out/$NAME/ || true
 
-          # app to firmware.bin (normalize)
-          APP=$(ls out/$NAME/*.bin | grep -E '\.ino\.bin$|_esp32.*\.bin$' | head -n1)
-          mv "$APP" out/$NAME/firmware.bin
+          # normalize app -> firmware.bin
+          APP=$(ls "$BUILD"/*/*.ino.bin "$BUILD"/*.ino.bin 2>/dev/null | head -n1 || true)
+          if [ -z "$APP" ]; then APP=$(ls out/$NAME/*.bin | head -n1); fi
+          cp "$APP" out/$NAME/firmware.bin
 
-          # ensure partitions + bootloader
-          [ -f out/$NAME/partitions.bin ] || cp $(find "$BUILD" -name partitions.bin | head -n1) out/$NAME/partitions.bin
-          [ -f out/$NAME/bootloader.bin ] || cp $(find "$BUILD" -name bootloader.bin | head -n1) out/$NAME/bootloader.bin
+          # partitions & bootloader from build; boot_app0 from core
+          cp "$(find "$BUILD" -name 'partitions.bin' | head -n1)"   out/$NAME/partitions.bin
+          cp "$(find "$BUILD" -name 'bootloader*.bin' | head -n1)"  out/$NAME/bootloader.bin
+          CORE=$(arduino-cli core list --format json | jq -r '.installed[]|select(.name|contains("esp32"))|.install_dir' | head -n1)
+          cp "$(find "$CORE" -name 'boot_app0.bin' | head -n1)"     out/$NAME/boot_app0.bin
 
-          # boot_app0 from core
-          CORE=$(arduino-cli core list --format json | jq -r '.installed[]|select(.name=="esp32").install_dir')
-          cp $(find "$CORE" -name boot_app0.bin | head -n1) out/$NAME/boot_app0.bin
-
-          # offsets file
-          cat > out/$NAME/flash_offsets.txt <<EOF
-bootloader.bin  0x0000
-partitions.bin  0x8000
-boot_app0.bin   0xE000
-firmware.bin    0x10000
-EOF
+          # offsets text (no here-doc)
+          printf "bootloader.bin  0x0000\npartitions.bin  0x8000\nboot_app0.bin   0xE000\nfirmware.bin    0x10000\n" > out/$NAME/flash_offsets.txt
 
           (cd out/$NAME && zip -9 ../${NAME}_bins.zip bootloader.bin partitions.bin boot_app0.bin firmware.bin flash_offsets.txt)
 
