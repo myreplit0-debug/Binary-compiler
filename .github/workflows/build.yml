@@ -1,0 +1,73 @@
+name: build
+
+on:
+  push:
+    paths: ["**/*.ino", ".github/workflows/build.yml"]
+  workflow_dispatch:
+
+jobs:
+  make:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        t:
+          # UI — ESP32-S3 N16R8 (16MB flash, 8MB PSRAM), huge HTML page
+          - {name: ui,    sketch: ui/ui.ino,    fqbn: "esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=default,FlashSize=16M,PartitionScheme=huge_app,PSRAM=opi,UploadSpeed=921600"}
+          # SMOKE — ESP32-S3 (adjust FlashSize if yours are 8M)
+          - {name: smoke, sketch: smoke/smoke.ino, fqbn: "esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=default,FlashSize=16M,PartitionScheme=default,PSRAM=opi,UploadSpeed=921600"}
+          # ICE — classic ESP32 DevKit v1
+          - {name: ice,   sketch: ice/ice.ino,   fqbn: "esp32:esp32:esp32:FlashFreq=80,FlashSize=4M,PartitionScheme=default,UploadSpeed=921600"}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v1
+      - name: install esp32 core
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+
+      - name: compile ${{ matrix.t.name }}
+        env:
+          FQBN: ${{ matrix.t.fqbn }}
+          SKETCH: ${{ matrix.t.sketch }}
+        run: |
+          set -e
+          arduino-cli compile --fqbn "$FQBN" --export-binaries "$SKETCH"
+          BUILD=$(arduino-cli compile --fqbn "$FQBN" --show-properties "$SKETCH" | grep '^build.path=' | cut -d= -f2-)
+          echo "BUILD=$BUILD" >> $GITHUB_ENV
+
+      - name: bundle 4-bin set (${{ matrix.t.name }})
+        env:
+          NAME: ${{ matrix.t.name }}
+        run: |
+          set -e
+          mkdir -p out/$NAME
+          cp "$BUILD"/*.bin out/$NAME/ || true
+
+          # app to firmware.bin (normalize)
+          APP=$(ls out/$NAME/*.bin | grep -E '\.ino\.bin$|_esp32.*\.bin$' | head -n1)
+          mv "$APP" out/$NAME/firmware.bin
+
+          # ensure partitions + bootloader
+          [ -f out/$NAME/partitions.bin ] || cp $(find "$BUILD" -name partitions.bin | head -n1) out/$NAME/partitions.bin
+          [ -f out/$NAME/bootloader.bin ] || cp $(find "$BUILD" -name bootloader.bin | head -n1) out/$NAME/bootloader.bin
+
+          # boot_app0 from core
+          CORE=$(arduino-cli core list --format json | jq -r '.installed[]|select(.name=="esp32").install_dir')
+          cp $(find "$CORE" -name boot_app0.bin | head -n1) out/$NAME/boot_app0.bin
+
+          # offsets file
+          cat > out/$NAME/flash_offsets.txt <<EOF
+bootloader.bin  0x0000
+partitions.bin  0x8000
+boot_app0.bin   0xE000
+firmware.bin    0x10000
+EOF
+
+          (cd out/$NAME && zip -9 ../${NAME}_bins.zip bootloader.bin partitions.bin boot_app0.bin firmware.bin flash_offsets.txt)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.t.name }}_bins
+          path: out/${{ matrix.t.name }}/*
