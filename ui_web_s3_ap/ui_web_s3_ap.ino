@@ -1,49 +1,77 @@
 /*
-  ui_web_s3_ap.ino
-  ESP32-S3 “UI Brain” (headless) with Wi-Fi Web UI + UART feed from tail SMOKE.
+  ui_web_s3_ap.ino — FULL UI
+  ESP32-S3 “UI Brain” with Wi-Fi Web UI + UART2 feed from tail SMOKE.
 
-  - Starts AP:  SSID: KeyGrid_UI    PASS: keygrid123
-  - Serves a single page at "/" (from PROGMEM)
-  - Browser polls /state.json (500 ms)
-  - Reads UART lines from tail SMOKE:
-      "UI: <room>.<tag>@<strength>, ..."   (presence snapshot)
-      "HELLO,mac=AA:BB:CC:DD:EE:FF,room=N"
+  - SoftAP:  SSID: KeyGrid_UI   PASS: keygrid123
+  - Single page app at "/"
+  - Browser polls /state.json (500ms)
+  - Reads UART2 lines from SMOKE tail:
+      "UI: r.t@S, ..." (snapshot)
+      "HELLO,mac=AA:BB:...,room=N"
+      "LOG: ICE UNMAPPED <RAW>"  (for alias helper)
+  - Edit on the same page:
+      • Set/Clear registration for a tag  (persist /regs.csv)
+      • Move/Forget tag (UI-local)
+      • Rename rooms (persist /rooms.txt)
+      • Map RAW → tag alias (persist /alias.csv and send MAP over Serial2)
 
   Hardware: ESP32-S3 Dev Module
-  UART (from SMOKE tail) on Serial2 (RX2=16, TX2=17 default; only RX2 used)
+  UART2: RX2=16 (from SMOKE TX), TX2=17 (to SMOKE RX, optional but used for MAP)
 */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <FS.h>
 
-// ------------ Pins (set to your wiring) ------------
+// ----- FS backend: LittleFS preferred, fallback to SPIFFS -----
+#if __has_include(<LittleFS.h>)
+  #include <LittleFS.h>
+  #define FSYS LittleFS
+#else
+  #include <SPIFFS.h>
+  #define FSYS SPIFFS
+#endif
+
+// ----- Pins -----
 #define UI_RX2 16
-#define UI_TX2 17   // not used, OK to leave unconnected
+#define UI_TX2 17
 
-// ------------ Wi-Fi AP ------------
+// ----- AP creds -----
 static const char* AP_SSID = "KeyGrid_UI";
 static const char* AP_PASS = "keygrid123";
 
-// ------------ Limits ------------
+// ----- Limits -----
 static const int MAX_ROOMS  = 25;
 static const int MAX_TAG_ID = 1024;
 static const int LOG_RING   = 200;
 static const int MAX_PEERS  = 40;
+static const int ALIAS_MAX  = 1024;
+static const int SEEN_MAX   = 128;
 
-// ------------ State ------------
+// ----- Files -----
+static const char* ROOMS_PATH = "/rooms.txt";
+static const char* ALIAS_PATH = "/alias.csv"; // raw,tag
+static const char* REGS_PATH  = "/regs.csv";  // tag,reg
+
+// ----- State -----
 String   roomNames[MAX_ROOMS];
-uint16_t tagRoom[MAX_TAG_ID + 1];
-uint8_t  tagStr [MAX_TAG_ID + 1];
-String   regByTag[MAX_TAG_ID + 1];
+uint16_t tagRoom[MAX_TAG_ID + 1];   // 0 = not present
+uint8_t  tagStr [MAX_TAG_ID + 1];   // 0..100
+String   regByTag[MAX_TAG_ID + 1];  // "" if none
 
 struct PeerInfo { String mac; int room; uint32_t lastMs; };
 PeerInfo peers[MAX_PEERS]; int peerCount=0;
 
+struct AliasEntry { String raw; uint16_t tag; bool used; };
+AliasEntry aliasMap[ALIAS_MAX];
+
+String seenRaw[SEEN_MAX]; int seenCount=0;
+
 String logBuf[LOG_RING]; int logPtr=0;
 inline void pushLog(const String& s){ logBuf[logPtr]=s; logPtr=(logPtr+1)%LOG_RING; Serial.println(s); }
 
-// ------------ Utils ------------
+// ----- Utils -----
 static inline String jsonEscape(const String& s){
   String o; o.reserve(s.length()+4);
   for(size_t i=0;i<s.length();++i){
@@ -59,9 +87,79 @@ static void setDefaultRooms(){
   for(int i=0;i<MAX_ROOMS;i++) roomNames[i] = (i<10? String(d[i]) : String());
 }
 
-// ------------ WebServer ------------
+// ----- FS helpers -----
+static void roomsLoad(){
+  for(int i=0;i<MAX_ROOMS;i++) roomNames[i]="";
+  File f=FSYS.open(ROOMS_PATH,"r");
+  if(!f){ setDefaultRooms(); return; }
+  int i=0; while(f.available() && i<MAX_ROOMS){ String l=f.readStringUntil('\n'); l.trim(); roomNames[i++]=l; }
+  f.close();
+}
+static void roomsSave(){
+  File w=FSYS.open(ROOMS_PATH,"w");
+  if(!w){ pushLog("[FS] rooms save fail"); return; }
+  int limit=0; for(int i=MAX_ROOMS-1;i>=0;i--){ if(roomNames[i].length()){ limit=i+1; break; } }
+  if(limit<5) limit=5;
+  for(int i=0;i<limit;i++) w.println(roomNames[i].length()?roomNames[i]:String("Room ")+String(i+1));
+  w.close(); pushLog("[FS] rooms saved");
+}
+static void aliasClear(){ for(int i=0;i<ALIAS_MAX;i++) aliasMap[i].used=false; }
+static void aliasLoad(){
+  aliasClear();
+  File f=FSYS.open(ALIAS_PATH,"r");
+  if(!f){ pushLog("[FS] no alias.csv"); return; }
+  while(f.available()){
+    String line=f.readStringUntil('\n'); line.trim(); if(!line.length()) continue;
+    int c=line.indexOf(','); if(c<0) continue;
+    String raw=line.substring(0,c); raw.trim();
+    uint16_t tag=(uint16_t)line.substring(c+1).toInt();
+    for(int i=0;i<ALIAS_MAX;i++) if(!aliasMap[i].used){ aliasMap[i].used=true; aliasMap[i].raw=raw; aliasMap[i].tag=tag; break; }
+  }
+  f.close(); pushLog("[FS] alias loaded");
+}
+static void aliasSave(){
+  File w=FSYS.open(ALIAS_PATH,"w");
+  if(!w){ pushLog("[FS] alias save fail"); return; }
+  for(int i=0;i<ALIAS_MAX;i++) if(aliasMap[i].used){ w.print(aliasMap[i].raw); w.print(","); w.println(aliasMap[i].tag); }
+  w.close(); pushLog("[FS] alias saved");
+}
+static int aliasFindRaw(const String& raw){ for(int i=0;i<ALIAS_MAX;i++) if(aliasMap[i].used && aliasMap[i].raw==raw) return i; return -1; }
+static void aliasSet(const String& raw, uint16_t tag){
+  int i=aliasFindRaw(raw);
+  if(i>=0){ aliasMap[i].tag=tag; }
+  else for(int k=0;k<ALIAS_MAX;k++) if(!aliasMap[k].used){ aliasMap[k].used=true; aliasMap[k].raw=raw; aliasMap[k].tag=tag; break; }
+  aliasSave();
+  // send MAP down to SMOKE chain (optional now, future-proof)
+  String line = "MAP,name=" + raw + ",id=" + String(tag);
+  Serial2.println(line);
+  pushLog("[MAP→SMOKE] " + line);
+}
+static void aliasDel(const String& raw){ int i=aliasFindRaw(raw); if(i>=0){ aliasMap[i].used=false; aliasSave(); } }
+
+static void regsLoad(){
+  for(int i=1;i<=MAX_TAG_ID;i++) regByTag[i]="";
+  File f=FSYS.open(REGS_PATH,"r");
+  if(!f){ pushLog("[FS] no regs.csv"); return; }
+  while(f.available()){
+    String line=f.readStringUntil('\n'); line.trim(); if(!line.length()) continue;
+    int c=line.indexOf(','); if(c<0) continue;
+    int id=line.substring(0,c).toInt();
+    String reg=line.substring(c+1); reg.trim();
+    if(id>=1 && id<=MAX_TAG_ID) regByTag[id]=reg;
+  }
+  f.close(); pushLog("[FS] regs loaded");
+}
+static void regsSave(){
+  File w=FSYS.open(REGS_PATH,"w");
+  if(!w){ pushLog("[FS] regs save fail"); return; }
+  for(int i=1;i<=MAX_TAG_ID;i++) if(regByTag[i].length()){ w.print(i); w.print(","); w.println(regByTag[i]); }
+  w.close(); pushLog("[FS] regs saved");
+}
+
+// ----- Web -----
 WebServer server(80);
 
+// Full single-page UI (with Manage tab + drawer)
 static const char INDEX_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
@@ -82,7 +180,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 .wrap{padding:.35rem .9rem 1rem}
 .grid{display:grid;gap:.9rem;grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}
 .card{position:relative;padding:1rem .9rem .9rem;border-radius:16px;background:linear-gradient(180deg,rgba(19,26,34,.88),rgba(11,16,23,.86));border:1px solid rgba(255,255,255,.07);box-shadow:var(--shadow)}
-.card h3{margin:.1rem 0 .6rem;font-size:18px}
+.card h3{margin:.1rem 0 .6rem;font-size:18px;cursor:pointer}
 .badge{position:absolute;top:.6rem;right:.6rem;font-size:13px;min-width:28px;text-align:center;background:linear-gradient(180deg,#2b3949,#1b2836);color:#e9f6ff;padding:.35rem .55rem;border-radius:999px;border:1px solid rgba(255,255,255,.07);box-shadow:var(--shadow)}
 .chips{display:flex;flex-wrap:wrap;gap:.6rem}
 .chip{padding:.55rem .7rem;border-radius:999px;background:linear-gradient(180deg,#0f1620,#0c141d);color:#cfe6ff;border:1px solid rgba(255,255,255,.07);box-shadow:inset 0 0 0 1px rgba(99,215,255,.15),var(--shadow);cursor:pointer}
@@ -90,74 +188,219 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 .row{display:flex;gap:.8rem;align-items:center;padding:.7rem .85rem;border-radius:12px;background:var(--panel);border:1px solid rgba(255,255,255,.06);box-shadow:var(--shadow);color:#d3e1f0}
 .mono{font-family:ui-monospace,Menlo,Consolas,monospace}
 .tag{padding:.2rem .45rem;border:1px solid rgba(255,255,255,.1);border-radius:8px;color:#d6f3ff;background:#0e1a24}
+.drawer{position:fixed;inset:auto 0 0 0;transform:translateY(105%);background:linear-gradient(180deg,rgba(17,23,31,.98),rgba(13,19,27,.98));border-top-left-radius:18px;border-top-right-radius:18px;border-top:1px solid rgba(255,255,255,.08);box-shadow:0 -20px 50px rgba(0,0,0,.6);backdrop-filter:blur(12px);transition:transform .28s ease;z-index:40;padding:1rem .9rem}
+.drawer.open{transform:translateY(0)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:.55rem}
+.muted{color:#9fb0c4}
+.small{font-size:12px;opacity:.85}
 </style>
+
 <div class=top>
   <div class=brand>Key Grid</div>
   <div class=tabs>
     <div class="tab active" data-tab=grid>Grid</div>
     <div class=tab data-tab=peers>Peers</div>
     <div class=tab data-tab=logs>Logs</div>
+    <div class=tab data-tab=manage>Manage</div>
   </div>
   <div class=status id=status>AP mode | waiting…</div>
 </div>
+
 <div class=controls id=gridControls>
   <label class=input><input id=q placeholder="Search reg or tag ID…"></label>
   <button class=btn id=btnSearch>Search</button>
 </div>
+
 <div class=wrap id=wrapGrid><div class=grid id=grid></div></div>
 <div class=list id=wrapPeers hidden></div>
 <div class=list id=wrapLogs hidden></div>
 
+<!-- Manage -->
+<div class=list id=wrapManage hidden>
+  <div class=row style="display:block">
+    <div class=muted style="margin-bottom:.35rem">Alias (map RAW → Tag)</div>
+    <div class=grid2>
+      <label class=input><input id=rawIn placeholder="RAW ID…"></label>
+      <label class=input><input id=rawTag type=number placeholder="Tag #"></label>
+    </div>
+    <div style="display:flex;gap:.6rem;margin-top:.5rem">
+      <button class=btn onclick="aliasSet()">Save Alias</button>
+      <button class=btn onclick="aliasDel()">Delete Alias</button>
+      <div class="small" id=aliasMsg></div>
+    </div>
+    <div class=muted style="margin:.7rem 0 .3rem">Seen RAW (tap to fill)</div>
+    <div id=seenWrap class="row" style="flex-wrap:wrap"></div>
+  </div>
+
+  <div class=row style="display:block">
+    <div class=muted style="margin-bottom:.35rem">Rooms</div>
+    <div id=roomsWrap style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.5rem"></div>
+    <div style="display:flex;gap:.6rem;margin-top:.5rem">
+      <button class=btn onclick="roomsSave()">Save Rooms</button>
+      <div class="small" id=roomsMsg></div>
+    </div>
+  </div>
+</div>
+
+<!-- Drawer -->
+<div class=drawer id=drawer>
+  <div style="display:flex;align-items:center;gap:.6rem;margin-bottom:.5rem">
+    <h4 style="margin:0;margin-right:auto">Tag details</h4>
+    <button class=btn id=closeDrawer>Close</button>
+  </div>
+  <div class=row>
+    <div style=flex:1><div class=muted>Tag ID</div><div id=dTag class=mono></div></div>
+    <div style=flex:1><div class=muted>Room</div><div id=dRoom class=mono></div></div>
+    <div style=flex:1><div class=muted>Strength</div><div id=dStr class=mono></div></div>
+  </div>
+  <div class=row style="display:block">
+    <div class=muted style="margin-bottom:.35rem">Registration</div>
+    <div class=grid2>
+      <label class=input><input id=dReg placeholder="e.g., 152MH12345"></label>
+      <button class="btn" id=saveReg>Save</button>
+    </div>
+  </div>
+  <div class=row style="display:block">
+    <div class=muted style="margin-bottom:.35rem">Move to room</div>
+    <div class=grid2>
+      <label class=input><input id=dMove type=number min=1 max=25 placeholder="Room #"></label>
+      <button class=btn id=doMove>Move</button>
+    </div>
+  </div>
+  <div class=row style="display:flex;justify-content:space-between">
+    <button class=btn id=clearReg>Clear reg</button>
+    <button class=btn id=forgetTag>Forget tag</button>
+  </div>
+</div>
+
 <script>
-let STATE={roomNames:[],tags:[],peers:[],logs:[]}; // tags: [{id,room,str,reg}]
+let STATE={roomNames:[],tags:[],peers:[],logs:[],seenRaw:[]}; // tags: [{id,room,str,reg}]
 let FILTER="";
-const tabs=document.querySelectorAll(".tab");
-tabs.forEach(t=>t.onclick=()=>{
-  tabs.forEach(x=>x.classList.remove("active"));
+
+// Tabs
+document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
+  document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
   t.classList.add("active");
   const id=t.dataset.tab;
-  document.getElementById("wrapGrid").hidden=(id!=="grid");
-  document.getElementById("gridControls").hidden=(id!=="grid");
-  document.getElementById("wrapPeers").hidden=(id!=="peers");
-  document.getElementById("wrapLogs").hidden=(id!=="logs");
+  wrap("wrapGrid", id==="grid");
+  wrap("gridControls", id==="grid");
+  wrap("wrapPeers", id==="peers");
+  wrap("wrapLogs", id==="logs");
+  wrap("wrapManage", id==="manage");
+  if(id==="manage") renderManage();
 });
-document.getElementById("btnSearch").onclick=()=>{FILTER=document.getElementById("q").value.trim().toUpperCase(); renderGrid();};
-document.getElementById("q").oninput=()=>{FILTER=document.getElementById("q").value.trim().toUpperCase(); renderGrid();};
+function wrap(id,show){ document.getElementById(id).hidden=!show; }
 
+// Search
+document.getElementById("btnSearch").onclick=()=>{FILTER=Q().toUpperCase(); renderGrid();};
+document.getElementById("q").oninput=()=>{FILTER=Q().toUpperCase(); renderGrid();};
+const Q=()=>document.getElementById("q").value.trim();
+
+// Grid
 const gridEl=document.getElementById("grid");
 function renderGrid(){
   gridEl.innerHTML="";
   const rooms = STATE.roomNames.length? STATE.roomNames : Array.from({length:5},(_,i)=>"Room "+(i+1));
-  for (let r=1;r<=rooms.length;r++){
-    const card=document.createElement("div"); card.className="card";
-    const h=document.createElement("h3"); h.textContent=rooms[r-1]||("Room "+r); card.appendChild(h);
-    const b=document.createElement("div"); b.className="badge"; b.textContent=STATE.tags.filter(t=>t.room===r).length; card.appendChild(b);
-    const chips=document.createElement("div"); chips.className="chips";
+  for(let r=1;r<=rooms.length;r++){
+    const card=div("card");
+    const h=document.createElement("h3");
+    h.textContent=rooms[r-1]||("Room "+r);
+    h.title="Rename room"; h.onclick=async()=>{
+      const v=prompt("Rename room "+r, h.textContent);
+      if(!v) return;
+      await post("/setRoom",{idx:r,name:v});
+      pollOnce();
+    };
+    card.appendChild(h);
+    card.appendChild(div("badge", STATE.tags.filter(t=>t.room===r).length));
+    const chips=div("chips");
     const here=STATE.tags.filter(t=>t.room===r).sort((a,b)=> String(a.reg||a.id).localeCompare(String(b.reg||b.id)));
     for(const t of here){
-      const label = t.reg || t.id;
+      const label=t.reg||t.id;
       if(FILTER && !String(label).toUpperCase().includes(FILTER) && !String(t.id).includes(FILTER)) continue;
-      const ch=document.createElement("div"); ch.className="chip"; ch.textContent=label; ch.title="S="+t.str;
-      ch.onclick=()=>alert('Tag '+t.id+'  Room '+t.room+'  S='+t.str);
+      const ch=div("chip", label); ch.title="S="+t.str; ch.onclick=()=>openDrawer(t);
       chips.appendChild(ch);
     }
     card.appendChild(chips); gridEl.appendChild(card);
   }
 }
+
+// Peers & Logs
 function renderPeers(){
   const wrap=document.getElementById("wrapPeers"); wrap.innerHTML="";
   if(!STATE.peers.length){ wrap.innerHTML='<div class=row>No peers yet.</div>'; return; }
   for(const p of STATE.peers){
-    const row=document.createElement("div"); row.className="row";
-    row.innerHTML=`<div class="mono tag">${p.mac}</div><div>room <b>${p.room||"?"}</b></div><div class=muted>seen ${p.ago||"?"} ago</div>`;
-    wrap.appendChild(row);
+    wrap.appendChild(rowHTML(`<div class="mono tag">${p.mac}</div><div>room <b>${p.room||"?"}</b></div><div class=muted>seen ${p.ago||"?"} ago</div>`));
   }
 }
 function renderLogs(){
   const wrap=document.getElementById("wrapLogs"); wrap.innerHTML="";
-  for(const L of STATE.logs){ const row=document.createElement("div"); row.className="row mono"; row.textContent=L; wrap.appendChild(row); }
+  for(const L of STATE.logs){ wrap.appendChild(rowText(L,"mono")); }
 }
 
+// Manage
+function renderManage(){
+  // rooms
+  const RW=document.getElementById("roomsWrap"); RW.innerHTML="";
+  const rooms=STATE.roomNames.length?STATE.roomNames:Array.from({length:5},(_,i)=>"Room "+(i+1));
+  rooms.forEach((nm,i)=>{
+    const w=div("",`<label class="input"><input id="rname_${i+1}" value="${nm||("Room "+(i+1))}"></label>`);
+    RW.appendChild(w);
+  });
+  // seen RAW
+  const SW=document.getElementById("seenWrap"); SW.innerHTML="";
+  for(const raw of STATE.seenRaw||[]){
+    const b=div("chip",raw); b.onclick=()=>{document.getElementById("rawIn").value=raw;};
+    SW.appendChild(b);
+  }
+}
+async function roomsSave(){
+  const rooms=[];
+  const nodes=[...document.querySelectorAll('[id^="rname_"]')];
+  nodes.forEach(n=>rooms.push(n.value.trim()));
+  await post("/roomsSave",{json:JSON.stringify(rooms)});
+  document.getElementById("roomsMsg").textContent="Saved.";
+  setTimeout(()=>document.getElementById("roomsMsg").textContent="",1500);
+}
+async function aliasSet(){
+  const raw=document.getElementById("rawIn").value.trim();
+  const tag=parseInt(document.getElementById("rawTag").value||"0");
+  if(!raw||!tag) return;
+  await post("/aliasSet",{raw,tag});
+  document.getElementById("aliasMsg").textContent="Alias saved.";
+  setTimeout(()=>document.getElementById("aliasMsg").textContent="",1500);
+  pollOnce();
+}
+async function aliasDel(){
+  const raw=document.getElementById("rawIn").value.trim(); if(!raw) return;
+  await post("/aliasDel",{raw});
+  document.getElementById("aliasMsg").textContent="Alias deleted.";
+  setTimeout(()=>document.getElementById("aliasMsg").textContent="",1500);
+  pollOnce();
+}
+
+// Drawer
+let curTag=null;
+const drawer=document.getElementById("drawer");
+const dTag=document.getElementById("dTag"), dRoom=document.getElementById("dRoom"), dStr=document.getElementById("dStr");
+const dReg=document.getElementById("dReg"), dMove=document.getElementById("dMove");
+function openDrawer(t){curTag=t.id; dTag.textContent=t.id; dRoom.textContent=t.room; dStr.textContent=t.str; dReg.value=t.reg||""; dMove.value=""; drawer.classList.add("open");}
+document.getElementById("closeDrawer").onclick=()=>drawer.classList.remove("open");
+document.getElementById("saveReg").onclick=async()=>{ if(!curTag) return; await post("/setReg",{tag:curTag,reg:dReg.value.trim()}); drawer.classList.remove("open"); pollOnce(); };
+document.getElementById("clearReg").onclick=async()=>{ if(!curTag) return; await post("/setReg",{tag:curTag,reg:""}); drawer.classList.remove("open"); pollOnce(); };
+document.getElementById("doMove").onclick=async()=>{ if(!curTag) return; const r=parseInt(dMove.value||"0"); if(r>0) await post("/moveTag",{tag:curTag,room:r}); drawer.classList.remove("open"); pollOnce(); };
+document.getElementById("forgetTag").onclick=async()=>{ if(!curTag) return; await post("/forgetTag",{tag:curTag}); drawer.classList.remove("open"); pollOnce(); };
+
+// Fetch helpers
+async function post(path, obj){
+  const b=new URLSearchParams(); for(const k in obj) b.append(k,obj[k]);
+  await fetch(path,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:b.toString()});
+}
+function div(c,html){ const d=document.createElement("div"); if(c) d.className=c; if(html!==undefined) d.innerHTML=html; return d; }
+function rowHTML(html){ const d=div("row"); d.innerHTML=html; return d; }
+function rowText(t,extra){ const d=div("row"+(extra?(" "+extra):"")); d.textContent=t; return d; }
+
+// Poll
 async function poll(){
   try{
     const r=await fetch("/state.json",{cache:"no-store"});
@@ -165,20 +408,36 @@ async function poll(){
   }catch(e){}
   setTimeout(poll,500);
 }
+async function pollOnce(){ try{ const r=await fetch("/state.json",{cache:"no-store"}); if(r.ok){ STATE=await r.json(); renderGrid(); renderPeers(); renderLogs(); renderManage(); } }catch(e){} }
+
 poll();
 </script>
 )HTML";
 
-WebServer::THandlerFunction notFound = [](){ server.send(404,"text/plain","404"); };
+// ------------- tiny helpers -------------
+static String formValue(const String& body, const char* key){
+  String k=String(key)+'=';
+  int p=body.indexOf(k); if(p<0) return "";
+  int e=body.indexOf('&', p+k.length()); if(e<0) e=body.length();
+  String v = body.substring(p+k.length(), e); v.replace("+"," ");
+  String o; o.reserve(v.length());
+  for(size_t i=0;i<v.length();++i){
+    if(v[i]=='%' && i+2<v.length()){ int v8=strtol(v.substring(i+1,i+3).c_str(),nullptr,16); o+=(char)v8; i+=2; }
+    else o+=v[i];
+  }
+  return o;
+}
+static void sendStatus(){
+  pushLog(String("[AP] ")+AP_SSID+"  IP: "+WiFi.softAPIP().toString());
+}
 
-// /state.json — snapshot
+// ------------- HTTP handlers -------------
 void handleStateJson(){
   WiFiClient client = server.client();
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");
 
-  String s = "{\"status\":\"AP ";
-  s += AP_SSID; s += " | UART feed\",\"roomNames\":[";
+  String s = "{\"status\":\"AP "+String(AP_SSID)+" | UART feed\",\"roomNames\":[";
   for(int i=0;i<MAX_ROOMS;i++){ if(i) s+=','; s+='\"'+jsonEscape(roomNames[i])+'\"'; }
   s += "],\"tags\":[";
   bool first=true;
@@ -195,25 +454,66 @@ void handleStateJson(){
   s += "],\"logs\":[";
   bool f2=true; for(int i=0;i<LOG_RING;i++){ int idx=(logPtr+i)%LOG_RING; if(logBuf[idx].length()){
     if(!f2) s+=','; f2=false; s+='\"'+jsonEscape(logBuf[idx])+'\"'; } }
+  s += "],\"seenRaw\":[";
+  for(int i=0;i<seenCount;i++){ if(i) s+=','; s+='\"'+jsonEscape(seenRaw[i])+'\"'; }
   s += "]}";
   client.print(s);
 }
-
-// simple x-www-form-urlencoded parser (used later if you add POST endpoints)
-static String urlValue(const String& body, const char* key){
-  String k=String(key)+'=';
-  int p=body.indexOf(k); if(p<0) return "";
-  int e=body.indexOf('&', p+k.length()); if(e<0) e=body.length();
-  String v = body.substring(p+k.length(), e); v.replace("+"," ");
-  String o; o.reserve(v.length());
-  for(size_t i=0;i<v.length();++i){
-    if(v[i]=='%' && i+2<v.length()){ int v8=strtol(v.substring(i+1,i+3).c_str(),nullptr,16); o+=(char)v8; i+=2; }
-    else o+=v[i];
+void handleSetReg(){
+  String body = server.hasArg("plain")? server.arg("plain") : "";
+  int id  = formValue(body,"tag").toInt();
+  String reg = formValue(body,"reg");
+  if(id>=1 && id<=MAX_TAG_ID){ regByTag[id]=reg; regsSave(); pushLog(String("[REG] tag ")+id+" = "+reg); }
+  server.send(200,"text/plain","OK");
+}
+void handleMoveTag(){
+  String body = server.hasArg("plain")? server.arg("plain") : "";
+  int id=formValue(body,"tag").toInt();
+  int room=formValue(body,"room").toInt();
+  if(id>=1 && id<=MAX_TAG_ID && room>=1 && room<=MAX_ROOMS){ tagRoom[id]=room; pushLog(String("[MOVE] tag ")+id+" -> room "+room); }
+  server.send(200,"text/plain","OK");
+}
+void handleForgetTag(){
+  String body = server.hasArg("plain")? server.arg("plain") : "";
+  int id=formValue(body,"tag").toInt();
+  if(id>=1 && id<=MAX_TAG_ID){ tagRoom[id]=0; tagStr[id]=0; pushLog(String("[FORGET] tag ")+id); }
+  server.send(200,"text/plain","OK");
+}
+void handleSetRoom(){
+  String body = server.hasArg("plain")? server.arg("plain") : "";
+  int idx=formValue(body,"idx").toInt();
+  String nm=formValue(body,"name");
+  if(idx>=1 && idx<=MAX_ROOMS){ roomNames[idx-1]=nm; pushLog(String("[ROOM] ")+idx+" = "+nm); }
+  server.send(200,"text/plain","OK");
+}
+void handleRoomsSave(){
+  // Expect optional "json=[...]" array of names; if present, apply before save
+  String body = server.hasArg("plain")? server.arg("plain") : "";
+  String j = formValue(body,"json");
+  if(j.length()){
+    // very small JSON parser: expects ["a","b",...]
+    int i=0, r=0; while(i<(int)j.length() && r<MAX_ROOMS){
+      int q1=j.indexOf('"', i); if(q1<0) break; int q2=j.indexOf('"', q1+1); if(q2<0) break;
+      roomNames[r++] = j.substring(q1+1,q2);
+      i = q2+1;
+    }
   }
-  return o;
+  roomsSave();
+  server.send(200,"text/plain","OK");
+}
+void handleAliasSet(){
+  String body = server.hasArg("plain")? server.arg("plain") : "";
+  String raw=formValue(body,"raw"); uint16_t tag=(uint16_t)formValue(body,"tag").toInt();
+  if(raw.length() && tag>0){ aliasSet(raw, tag); }
+  server.send(200,"text/plain","OK");
+}
+void handleAliasDel(){
+  String body = server.hasArg("plain")? server.arg("plain") : "";
+  String raw=formValue(body,"raw"); if(raw.length()) aliasDel(raw);
+  server.send(200,"text/plain","OK");
 }
 
-// ------------ UART parsing ------------
+// ------------- UART2 parsing -------------
 volatile bool u2Flag=false; String u2Q;
 
 static void parseLine(String s){
@@ -230,7 +530,16 @@ static void parseLine(String s){
     pushLog(s); return;
   }
 
-  // "UI:" or "DATA:UI:"
+  if(s.startsWith("LOG: ICE UNMAPPED ")){
+    String raw = s.substring(strlen("LOG: ICE UNMAPPED ")); raw.trim();
+    if(raw.length()){
+      bool have=false; for(int i=0;i<seenCount;i++) if(seenRaw[i]==raw){ have=true; break; }
+      if(!have && seenCount<SEEN_MAX){ seenRaw[seenCount++]=raw; }
+    }
+    pushLog(s); return;
+  }
+
+  // Accept "UI:" or "DATA:UI:"
   int colon=s.indexOf(':'); if(colon>=0) s=s.substring(colon+1);
 
   static bool seen[MAX_TAG_ID+1]; memset(seen,0,sizeof(seen));
@@ -252,7 +561,6 @@ static void parseLine(String s){
   }
   pushLog("[UI] update received");
 }
-
 static void pumpUART2(){
   while(Serial2.available()){
     char c=(char)Serial2.read();
@@ -270,22 +578,32 @@ static void pumpUART2(){
   }
 }
 
-// ------------ Setup / Loop ------------
+// ------------- Setup / Loop -------------
 void setup(){
   Serial.begin(115200);
   Serial2.begin(115200, SERIAL_8N1, UI_RX2, UI_TX2);
 
-  setDefaultRooms();
-  for(int i=1;i<=MAX_TAG_ID;i++){ tagRoom[i]=0; tagStr[i]=0; regByTag[i]=""; }
+  FSYS.begin(true);
+  roomsLoad(); aliasLoad(); regsLoad();
+
+  for(int i=1;i<=MAX_TAG_ID;i++){ tagRoom[i]=0; tagStr[i]=0; }
 
   WiFi.mode(WIFI_AP);
   bool ok=WiFi.softAP(AP_SSID, AP_PASS);
-  pushLog(String("[AP] ")+(ok?"started ":"FAILED ") + String(AP_SSID) + "  IP: " + WiFi.softAPIP().toString());
+  (void)ok; sendStatus();
 
   server.on("/", HTTP_GET, [](){ server.send_P(200,"text/html; charset=utf-8", INDEX_HTML); });
-  server.on("/state.json", HTTP_GET, handleStateJson);
-  server.onNotFound(notFound);
+  server.on("/state.json",  HTTP_GET, handleStateJson);
+  server.on("/setReg",      HTTP_POST, handleSetReg);
+  server.on("/moveTag",     HTTP_POST, handleMoveTag);
+  server.on("/forgetTag",   HTTP_POST, handleForgetTag);
+  server.on("/setRoom",     HTTP_POST, handleSetRoom);
+  server.on("/roomsSave",   HTTP_POST, handleRoomsSave);
+  server.on("/aliasSet",    HTTP_POST, handleAliasSet);
+  server.on("/aliasDel",    HTTP_POST, handleAliasDel);
+  server.onNotFound([](){ server.send(404,"text/plain","404"); });
   server.begin();
+
   pushLog("[UI] ready → http://"+WiFi.softAPIP().toString()+"/");
 }
 
@@ -293,4 +611,3 @@ void loop(){
   pumpUART2();
   server.handleClient();
 }
-
