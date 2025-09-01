@@ -1,47 +1,45 @@
 /*
-  smoke_chain_s3.ino  —  SMOKE node (ESP32-S3)  •  Arduino-ESP32 core 3.x
+  smoke_chain_s3.ino  —  SMOKE node (ESP32-S3) • Arduino-ESP32 core 3.x
 
   Chain:
-    ICE --UART1--> SMOKE(1) --ESP-NOW ch6--> ... --ESP-NOW--> SMOKE(tail) --UART1--> UI S3
+    ICE --UART1--> SMOKE(1) --ESP-NOW ch6--> ... --> SMOKE(tail) --UART1--> UI S3
 
-  What each SMOKE does per ~800 ms cycle:
-    • Non-tail: originate frame from its local tags; merge any upstream frame; keep strongest tag; forward once.
-    • Tail: merge all and print exactly one UI line:
-         UI: <room>.<tag>@<str>, <room>.<tag>@<str>, ...
+  UART1:
+    • Non-tail: RX from ICE (raw BLE lines)
+    • Tail:     TX to UI (“UI: r.t@s, r.t@s, …”) and HELLO/CFG passthrough
 
-  UI-driven config (via ESP-NOW or UART1 for bench):
-    CFG:room=<n>        (0..25)
+  UI config (sent over ESPNOW; also accepted on UART1 for bench):
+    CFG:room=<n>      (0..25)
     CFG:tail=0|1
     CFG:next=AA:BB:CC:DD:EE:FF
     CFG:clear
 
-  Pins (edit if needed):
-    UART1 RX/TX to ICE (tail’s UART1 goes to UI).
+  All UI assignments happen in the UI. Nodes boot unassigned (room=0).
 */
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_now.h>
 #include <Preferences.h>
 
-// ---------------- Pins ----------------
-#define RX1_PIN      18
-#define TX1_PIN      17
-#define UART_BAUD    115200
+// ---------- Pins ----------
+#define RX1_PIN    18
+#define TX1_PIN    17
+#define UART_BAUD  115200
 
-// ---------------- ESP-NOW ----------------
-#define ESPNOW_CH        6
+// ---------- ESPNOW ----------
+#define ESPNOW_CH  6
 static const uint8_t BCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
-// ---------------- Limits & timings ----------------
+// ---------- Limits & timing ----------
 #define MAX_ITEMS        160
 #define TAG_TTL_MS       2000
 #define CYCLE_MS          800
 #define FWD_DEBOUNCE_MS    30
 #define HELLO_MS         3000
 
-// ---------------- Persisted config ----------------
+// ---------- Persisted config ----------
 Preferences prefs;
 struct Config {
   uint8_t room = 0;        // 0 = unassigned
@@ -68,7 +66,9 @@ static void loadCfg(){
   prefs.end();
 }
 
-// ---------------- Helpers ----------------
+// ---------- Small helpers ----------
+static inline uint8_t clampU8(int v){ if(v<0) v=0; if(v>100) v=100; return (uint8_t)v; }
+
 static bool macFromStr(const String& s, uint8_t out[6]){
   int p=0, b=0;
   while(b<6){
@@ -76,23 +76,16 @@ static bool macFromStr(const String& s, uint8_t out[6]){
     int v = strtol(s.substring(p,p+2).c_str(), nullptr, 16);
     out[b++] = (uint8_t)v;
     p += 2;
-    if(b<6){
-      if(p >= (int)s.length() || s[p] != ':') return false;
-      p++;
-    }
+    if(b<6){ if(p >= (int)s.length() || s[p] != ':') return false; p++; }
   }
   return true;
 }
 static String macToStr(const uint8_t m[6]){
-  char buf[18];
-  sprintf(buf,"%02X:%02X:%02X:%02X:%02X:%02X",m[0],m[1],m[2],m[3],m[4],m[5]);
-  return String(buf);
+  char buf[18]; sprintf(buf,"%02X:%02X:%02X:%02X:%02X:%02X",m[0],m[1],m[2],m[3],m[4],m[5]); return String(buf);
 }
 static uint8_t MYMAC[6];
 
-static inline uint8_t clampU8(int v){ if(v<0) v=0; if(v>100) v=100; return (uint8_t)v; }
-
-// ---------------- Local dedup table ----------------
+// ---------- Local dedup (per node) ----------
 struct Item { uint16_t tag; uint8_t str; uint32_t seen; };
 static Item table_[MAX_ITEMS]; static int nItems=0;
 
@@ -125,7 +118,7 @@ static void decay(){
   }
 }
 
-// Ingest lines from ICE on UART1
+// Ingest ICE UART line → update local table
 static void parseIceLine(String s){
   s.trim(); if(!s.length()) return;
   String name; long id=-1; int rssi=0; bool have=false;
@@ -146,7 +139,7 @@ static void parseIceLine(String s){
   if(have && tag>0) upsert(tag, rssiToStrength(rssi));
 }
 
-// ---------------- Cycle aggregator ----------------
+// ---------- Per-cycle aggregator ----------
 struct Agg {
   int      cyc = -1;
   uint16_t tag[MAX_ITEMS];
@@ -154,6 +147,7 @@ struct Agg {
   int      n = 0;
   uint32_t updated = 0;
 };
+
 static void aggReset(Agg& A, int cyc){ A.cyc=cyc; A.n=0; A.updated=millis(); }
 static int  aggFind(const Agg& A, uint16_t t){ for(int i=0;i<A.n;i++) if(A.tag[i]==t) return i; return -1; }
 static void aggMergeOne(Agg& A, uint16_t t, uint8_t s){
@@ -193,17 +187,17 @@ static String aggToPayload(const Agg& A, int room){
   return o;
 }
 
-// Aggregators
+// Working sets + pacing
 static Agg FWD, UIA;
 static bool fwdArmed=false; static uint32_t fwdDue=0;
 static int  lastPrintedCyc=-1;
 
-// ---------------- ESP-NOW callbacks (core 3.x) ----------------
-void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len){
+// ---------- ESPNOW callbacks (core 3.x) ----------
+static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len){
   (void)info;
   if(!data || len<=0) return;
 
-  // CFG frames
+  // Config frames
   if(len>=4 && data[0]=='C' && data[1]=='F' && data[2]=='G' && data[3]==':'){
     String s((const char*)data, len); s.trim();
     if(s.indexOf("clear")>=0){
@@ -220,7 +214,7 @@ void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len){
     return;
   }
 
-  // U#C:<list>
+  // Upstream data U#C:<list>
   if(len>=3 && data[0]=='U' && data[1]=='#'){
     int i=2; int j=i; while(j<len && data[j]!=':') j++;
     if(j>=len) return;
@@ -239,17 +233,17 @@ void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len){
     return;
   }
 
-  // HELLO passthrough to UART (tail)
+  // HELLO passthrough to UART (tail only)
   if(len>=5 && data[0]=='H' && data[1]=='E'){
     if(CFG.isTail) { Serial1.write(data, len); Serial1.write('\n'); }
   }
 }
 
-void onSent(const uint8_t* mac_addr, esp_now_send_status_t status){
+static void onSent(const uint8_t* mac_addr, esp_now_send_status_t status){
   (void)mac_addr; (void)status;
 }
 
-// ---------------- ESP-NOW init ----------------
+// ---------- ESPNOW init ----------
 static bool addPeerIfMissing(const uint8_t mac[6]){
   if(esp_now_is_peer_exist(mac)) return true;
   esp_now_peer_info_t p={};
@@ -264,7 +258,8 @@ static bool espnowInit(){
   esp_wifi_set_channel(ESPNOW_CH, WIFI_SECOND_CHAN_NONE);
   if(esp_now_init()!=ESP_OK) return false;
   esp_now_register_recv_cb(onRecv);
-  esp_now_register_send_cb(onSent);
+  // make the type match exactly (some toolchains typedef uint8_t differently)
+  esp_now_register_send_cb((esp_now_send_cb_t)onSent);
   addPeerIfMissing(BCAST);
   if(CFG.hasNext) addPeerIfMissing(CFG.next);
   esp_wifi_get_mac(WIFI_IF_STA, MYMAC);
@@ -276,7 +271,7 @@ static void sendStr(const uint8_t mac[6], const String& s){
 }
 static void broadcastStr(const String& s){ sendStr(BCAST, s); }
 
-// ---------------- Periodics ----------------
+// ---------- Periodics ----------
 static uint32_t tHello=0, tCycleTick=0;
 static String uartBuf;
 
@@ -322,7 +317,7 @@ static void tailPrintIfReady(){
   }
 }
 
-// ---------------- Setup / Loop ----------------
+// ---------- Setup / Loop ----------
 void setup(){
   Serial.begin(115200);
   Serial1.begin(UART_BAUD, SERIAL_8N1, RX1_PIN, TX1_PIN);
@@ -337,7 +332,7 @@ void setup(){
 }
 
 void loop(){
-  // UART1 ingest (ICE lines or bench CFG:)
+  // UART1 ingest (ICE lines or bench CFG: commands)
   while(Serial1.available()){
     char c=(char)Serial1.read();
     if(c=='\n'){
@@ -363,8 +358,8 @@ void loop(){
   decay();
 
   uint32_t now=millis();
-  if(now - tHello >= HELLO_MS){ tHello=now; sendHello(); }
-  if(now - tCycleTick >= CYCLE_MS){ tCycleTick=now; originateCycle(); }
+  if(now - tHello     >= HELLO_MS) { tHello=now; sendHello(); }
+  if(now - tCycleTick >= CYCLE_MS) { tCycleTick=now; originateCycle(); }
   forwardIfDue();
   tailPrintIfReady();
 }
