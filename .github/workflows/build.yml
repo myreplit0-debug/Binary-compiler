@@ -29,7 +29,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq zip
 
-      # --- compile and EXPORT build dir as an output ---
+      # compile and export the build directory path
       - name: compile ${{ matrix.t.name }}
         id: build
         env:
@@ -43,7 +43,7 @@ jobs:
           echo "Built in: $BUILD"
           ls -la "$BUILD" || true
 
-      # --- bundle using the build dir from previous step ---
+      # bundle four .bin files + offsets text
       - name: bundle ${{ matrix.t.name }}
         env:
           NAME:  ${{ matrix.t.name }}
@@ -55,10 +55,9 @@ jobs:
 
           mkdir -p out/$NAME
 
-          APP=$(find "$BUILD" -maxdepth 2 -type f -name '*.ino.bin'        -print -quit)
-          PART=$(find "$BUILD" -maxdepth 2 -type f -name '*partitions.bin'  -print -quit)
-          BOOT=$(find "$BUILD" -maxdepth 2 -type f -name 'bootloader*.bin'  -print -quit)
-          echo "APP=$APP"; echo "PART=$PART"; echo "BOOT=$BOOT"
+          APP=$(find "$BUILD" -maxdepth 2 -type f -name '*.ino.bin'       -print -quit)
+          PART=$(find "$BUILD" -maxdepth 2 -type f -name '*partitions.bin' -print -quit)
+          BOOT=$(find "$BUILD" -maxdepth 2 -type f -name 'bootloader*.bin' -print -quit)
 
           : ${APP:?app *.ino.bin not found}
           : ${PART:?*partitions.bin not found}
@@ -73,12 +72,12 @@ jobs:
           : ${APP0:?boot_app0.bin not found in core}
           cp "$APP0" out/$NAME/boot_app0.bin
 
-          cat > out/$NAME/flash_offsets.txt <<'OFF'
-bootloader.bin  0x0000
-partitions.bin  0x8000
-boot_app0.bin   0xE000
-firmware.bin    0x10000
-OFF
+          printf '%s\n%s\n%s\n%s\n' \
+            'bootloader.bin  0x0000' \
+            'partitions.bin  0x8000' \
+            'boot_app0.bin   0xE000' \
+            'firmware.bin    0x10000' \
+            > out/$NAME/flash_offsets.txt
 
           (cd out/$NAME && zip -9 ../${NAME}_bins.zip bootloader.bin partitions.bin boot_app0.bin firmware.bin flash_offsets.txt)
 
