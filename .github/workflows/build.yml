@@ -1,4 +1,57 @@
-- name: bundle ${{ matrix.t.name }}
+name: build
+
+on:
+  push:
+    paths:
+      - "**/*.ino"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+jobs:
+  make:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        t:
+          - name: ui
+            sketch: ui_web_s3_ap/ui_web_s3_ap.ino
+            fqbn: esp32:esp32:esp32s3
+          - name: smoke
+            sketch: smoke_chain_s3/smoke_chain_s3.ino
+            fqbn: esp32:esp32:esp32s3
+          - name: ice
+            sketch: ice_ble_uart/ice_ble_uart.ino
+            fqbn: esp32:esp32:esp32
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup arduino-cli
+        uses: arduino/setup-arduino-cli@v1
+
+      - name: deps
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+          sudo apt-get update
+          sudo apt-get install -y jq zip
+
+      - name: compile ${{ matrix.t.name }}
+        id: build
+        env:
+          FQBN:   ${{ matrix.t.fqbn }}
+          SKETCH: ${{ matrix.t.sketch }}
+        run: |
+          set -e
+          arduino-cli compile --fqbn "$FQBN" --export-binaries "$SKETCH"
+          BUILD=$(arduino-cli compile --fqbn "$FQBN" --show-properties "$SKETCH" | sed -n 's/^build.path=//p' | tail -n1)
+          echo "build_dir=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "Built in: $BUILD"
+          ls -la "$BUILD" || true
+
+      - name: bundle ${{ matrix.t.name }}
         env:
           NAME:  ${{ matrix.t.name }}
           BUILD: ${{ steps.build.outputs.build_dir }}
@@ -10,7 +63,7 @@
 
           mkdir -p out/$NAME
 
-          # ---- build outputs (from compile) ----
+          # build outputs
           APP=$(find "$BUILD" -maxdepth 2 -type f -name '*.ino.bin'        -print -quit)
           PART=$(find "$BUILD" -maxdepth 2 -type f -name '*partitions.bin'  -print -quit)
           BOOT=$(find "$BUILD" -maxdepth 3 -type f -name 'bootloader*.bin'  -print -quit || true)
@@ -21,19 +74,13 @@
             exit 1
           fi
 
-          # ---- locate core install dir robustly ----
+          # locate ESP32 core dir robustly
           DATA_DIR=$(arduino-cli config dump --format json | jq -r '.directories.data')
           HW_BASE="$DATA_DIR/packages/esp32/hardware/esp32"
-          if [ ! -d "$HW_BASE" ]; then
-            echo "ESP32 core not found under $HW_BASE"
-            find "$DATA_DIR/packages" -maxdepth 3 -type d -print | sed 's/^/  /'
-            exit 1
-          fi
           CORE_VER=$(ls -1 "$HW_BASE" | sort -V | tail -n1)
           CORE="$HW_BASE/$CORE_VER"
           echo "Core dir: $CORE"
 
-          # ---- prebuilt bootloader / boot_app0 from core tools ----
           FAMILY=$(echo "$FQBN" | awk -F: '{print $3}')
           if [ -z "$BOOT" ]; then
             if [ "$FAMILY" = "esp32s3" ]; then
@@ -48,19 +95,16 @@
           else
             APP0=$(find "$CORE/tools" -type f -path '*/esp32/bin/*' -name 'boot_app0.bin' -print -quit)
           fi
-          # fallback search anywhere under core
           if [ -z "$APP0" ]; then APP0=$(find "$CORE" -type f -name 'boot_app0.bin' -print -quit); fi
 
-          : ${BOOT:?bootloader.bin not found in core tools}
-          : ${APP0:?boot_app0.bin not found in core}
+          : ${BOOT:?bootloader.bin not found}
+          : ${APP0:?boot_app0.bin not found}
 
-          # ---- copy & name consistently ----
           cp "$APP"  out/$NAME/firmware.bin
           cp "$PART" out/$NAME/partitions.bin
           cp "$BOOT" out/$NAME/bootloader.bin
           cp "$APP0" out/$NAME/boot_app0.bin
 
-          # ---- offsets file for phone flasher ----
           cat > out/$NAME/flash_offsets.txt <<'EOF'
 bootloader.bin  0x0000
 partitions.bin  0x8000
@@ -69,3 +113,9 @@ firmware.bin    0x10000
 EOF
 
           (cd out/$NAME && zip -9 ../${NAME}_bins.zip bootloader.bin partitions.bin boot_app0.bin firmware.bin flash_offsets.txt)
+
+      - name: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.t.name }}_bins
+          path: out/${{ matrix.t.name }}/*
