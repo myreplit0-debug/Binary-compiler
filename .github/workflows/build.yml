@@ -1,48 +1,4 @@
-name: build
-
-on:
-  push:
-    paths:
-      - "**/*.ino"
-      - ".github/workflows/build.yml"
-  workflow_dispatch:
-
-jobs:
-  make:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        t:
-          - { name: ui,    sketch: ui_web_s3_ap/ui_web_s3_ap.ino,     fqbn: "esp32:esp32:esp32s3" }
-          - { name: smoke, sketch: smoke_chain_s3/smoke_chain_s3.ino, fqbn: "esp32:esp32:esp32s3" }
-          - { name: ice,   sketch: ice_ble_uart/ice_ble_uart.ino,     fqbn: "esp32:esp32:esp32" }
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: arduino/setup-arduino-cli@v1
-
-      - name: deps
-        run: |
-          arduino-cli core update-index
-          arduino-cli core install esp32:esp32
-          sudo apt-get update
-          sudo apt-get install -y jq zip
-
-      - name: compile ${{ matrix.t.name }}
-        id: build
-        env:
-          FQBN:   ${{ matrix.t.fqbn }}
-          SKETCH: ${{ matrix.t.sketch }}
-        run: |
-          set -e
-          arduino-cli compile --fqbn "$FQBN" --export-binaries "$SKETCH"
-          BUILD=$(arduino-cli compile --fqbn "$FQBN" --show-properties "$SKETCH" | sed -n 's/^build.path=//p' | tail -n1)
-          echo "build_dir=$BUILD" >> "$GITHUB_OUTPUT"
-          echo "Built in: $BUILD"
-          ls -la "$BUILD" || true
-
-      - name: bundle ${{ matrix.t.name }}
+- name: bundle ${{ matrix.t.name }}
         env:
           NAME:  ${{ matrix.t.name }}
           BUILD: ${{ steps.build.outputs.build_dir }}
@@ -54,23 +10,32 @@ jobs:
 
           mkdir -p out/$NAME
 
-          # build outputs
-          APP=$(find "$BUILD" -maxdepth 2 -type f -name '*.ino.bin'       -print -quit)
-          PART=$(find "$BUILD" -maxdepth 2 -type f -name '*partitions.bin' -print -quit)
-          BOOT=$(find "$BUILD" -maxdepth 3 -type f -name 'bootloader*.bin' -print -quit || true)
+          # ---- build outputs (from compile) ----
+          APP=$(find "$BUILD" -maxdepth 2 -type f -name '*.ino.bin'        -print -quit)
+          PART=$(find "$BUILD" -maxdepth 2 -type f -name '*partitions.bin'  -print -quit)
+          BOOT=$(find "$BUILD" -maxdepth 3 -type f -name 'bootloader*.bin'  -print -quit || true)
 
           if [ -z "$APP" ] || [ -z "$PART" ]; then
-            echo "Build outputs missing:"
+            echo "Build outputs missing; tree follows:"
             ls -R "$BUILD"
             exit 1
           fi
 
-          # core install dir
-          CORE=$(arduino-cli core list --format json | jq -r '.installed[]|select(.name|contains("esp32"))|.install_dir' | head -n1)
+          # ---- locate core install dir robustly ----
+          DATA_DIR=$(arduino-cli config dump --format json | jq -r '.directories.data')
+          HW_BASE="$DATA_DIR/packages/esp32/hardware/esp32"
+          if [ ! -d "$HW_BASE" ]; then
+            echo "ESP32 core not found under $HW_BASE"
+            find "$DATA_DIR/packages" -maxdepth 3 -type d -print | sed 's/^/  /'
+            exit 1
+          fi
+          CORE_VER=$(ls -1 "$HW_BASE" | sort -V | tail -n1)
+          CORE="$HW_BASE/$CORE_VER"
+          echo "Core dir: $CORE"
 
-          # prebuilt bootloader (core 3.x keeps it under tools/*/bin)
+          # ---- prebuilt bootloader / boot_app0 from core tools ----
+          FAMILY=$(echo "$FQBN" | awk -F: '{print $3}')
           if [ -z "$BOOT" ]; then
-            FAMILY=$(echo "$FQBN" | awk -F: '{print $3}')
             if [ "$FAMILY" = "esp32s3" ]; then
               BOOT=$(find "$CORE/tools" -type f -path '*/esp32s3/bin/*' -name 'bootloader*.bin' -print -quit)
             else
@@ -78,27 +43,29 @@ jobs:
             fi
           fi
 
-          APP0=$(find "$CORE/tools" -type f -path '*/esp32s3/bin/*' -name 'boot_app0.bin' -print -quit)
+          if [ "$FAMILY" = "esp32s3" ]; then
+            APP0=$(find "$CORE/tools" -type f -path '*/esp32s3/bin/*' -name 'boot_app0.bin' -print -quit)
+          else
+            APP0=$(find "$CORE/tools" -type f -path '*/esp32/bin/*' -name 'boot_app0.bin' -print -quit)
+          fi
+          # fallback search anywhere under core
           if [ -z "$APP0" ]; then APP0=$(find "$CORE" -type f -name 'boot_app0.bin' -print -quit); fi
 
-          : ${BOOT:?bootloader.bin not found}
-          : ${APP0:?boot_app0.bin not found}
+          : ${BOOT:?bootloader.bin not found in core tools}
+          : ${APP0:?boot_app0.bin not found in core}
 
+          # ---- copy & name consistently ----
           cp "$APP"  out/$NAME/firmware.bin
           cp "$PART" out/$NAME/partitions.bin
           cp "$BOOT" out/$NAME/bootloader.bin
           cp "$APP0" out/$NAME/boot_app0.bin
 
-          printf '%s\n%s\n%s\n%s\n' \
-            'bootloader.bin  0x0000' \
-            'partitions.bin  0x8000' \
-            'boot_app0.bin   0xE000' \
-            'firmware.bin    0x10000' \
-            > out/$NAME/flash_offsets.txt
+          # ---- offsets file for phone flasher ----
+          cat > out/$NAME/flash_offsets.txt <<'EOF'
+bootloader.bin  0x0000
+partitions.bin  0x8000
+boot_app0.bin   0xE000
+firmware.bin    0x10000
+EOF
 
           (cd out/$NAME && zip -9 ../${NAME}_bins.zip bootloader.bin partitions.bin boot_app0.bin firmware.bin flash_offsets.txt)
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.t.name }}_bins
-          path: out/${{ matrix.t.name }}/*
