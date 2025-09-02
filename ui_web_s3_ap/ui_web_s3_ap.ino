@@ -1,7 +1,7 @@
 // UI controller (ESP32-S3) — ESP-NOW only, Serial CLI
 // - Prints REPORTs from tail to USB Serial
 // - Manages chain (idx/next/slots, tail), rooms, and tag registry
-// - Works with SMOKE/ICE sketches below
+// - Works with SMOKE/ICE sketches
 //
 // Build FQBN: esp32:esp32:esp32s3
 
@@ -9,52 +9,87 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_now.h>
-#include <unordered_map>
 #include <vector>
 #include <array>
+#include <unordered_map>
 
+// ---------- channel ----------
 #define ESPNOW_CH 6
 
-// ---------- utils ----------
-static uint8_t BCAST[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+// ---------- helpers for String in unordered_map ----------
+struct StringHash {
+  size_t operator()(const String& s) const noexcept {
+    // FNV-1a 64-bit over bytes of the String
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < s.length(); ++i) {
+      h ^= (uint8_t)s[i];
+      h *= 1099511628211ull;
+    }
+    return (size_t)h;
+  }
+};
+struct StringEq {
+  bool operator()(const String& a, const String& b) const noexcept {
+    if (a.length() != b.length()) return false;
+    return strcmp(a.c_str(), b.c_str()) == 0;
+  }
+};
+
+// ---------- esp-now utils ----------
+static uint8_t BCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
 static bool addPeer(const uint8_t m[6]) {
   if (esp_now_is_peer_exist(m)) return true;
-  esp_now_peer_info_t p={}; memcpy(p.peer_addr,m,6); p.channel=ESPNOW_CH; p.encrypt=false;
-  return esp_now_add_peer(&p)==ESP_OK;
+  esp_now_peer_info_t p = {};
+  memcpy(p.peer_addr, m, 6);
+  p.channel = ESPNOW_CH;
+  p.encrypt = false;
+  return esp_now_add_peer(&p) == ESP_OK;
 }
-static void sendNow(const uint8_t* mac, const String& s){ addPeer(mac); esp_now_send(mac,(const uint8_t*)s.c_str(), s.length()); }
-static void sendBcast(const String& s){ addPeer(BCAST); esp_now_send(BCAST,(const uint8_t*)s.c_str(), s.length()); }
-static void macToStr(const uint8_t m[6], char out[18]){ sprintf(out,"%02X:%02X:%02X:%02X:%02X:%02X",m[0],m[1],m[2],m[3],m[4],m[5]); }
+static void sendNow(const uint8_t* mac, const String& s){
+  addPeer(mac); esp_now_send(mac, (const uint8_t*)s.c_str(), s.length());
+}
+static void sendBcast(const String& s){
+  addPeer(BCAST); esp_now_send(BCAST, (const uint8_t*)s.c_str(), s.length());
+}
+static void macToStr(const uint8_t m[6], char out[18]){
+  sprintf(out,"%02X:%02X:%02X:%02X:%02X:%02X",m[0],m[1],m[2],m[3],m[4],m[5]);
+}
 static bool strToMac(const String& s, uint8_t m[6]){
-  if (s.length()!=17) return false; int b[6];
+  if (s.length()!=17) return false;
+  int b[6];
   if (sscanf(s.c_str(),"%2x:%2x:%2x:%2x:%2x:%2x",&b[0],&b[1],&b[2],&b[3],&b[4],&b[5])!=6) return false;
-  for(int i=0;i<6;i++) m[i]=(uint8_t)b[i]; return true;
+  for (int i=0;i<6;i++) m[i]=(uint8_t)b[i];
+  return true;
 }
 
 // ---------- UI state ----------
 struct Peer { uint8_t mac[6]; uint8_t idx=0; uint8_t room=0; bool tail=false; String next; uint32_t last=0; };
 static std::vector<Peer> peers;
-static uint8_t tailMac[6]={0};
+static uint8_t tailMac[6] = {0};
 static bool haveTail=false;
 
-static std::unordered_map<String,uint16_t> aliasRawToId; // RAW name -> tag id (1..2048)
-static std::unordered_map<uint16_t,String> regByTag;     // tag id -> reg text
+// maps that were failing before
+static std::unordered_map<String, uint16_t, StringHash, StringEq> aliasRawToId; // RAW name -> tag ID (1..2048)
+static std::unordered_map<uint16_t, String> regByTag;                           // tag ID -> reg text
 
 // ---------- RX ----------
 static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len){
-  String msg; msg.reserve(len+1); for(int i=0;i<len;i++) msg+=(char)data[i];
+  String msg; msg.reserve(len+1); for(int i=0;i<len;i++) msg += (char)data[i];
   uint8_t src[6]; memcpy(src, info->src_addr, 6);
   char smac[18]; macToStr(src, smac);
 
   if (msg.startsWith("HELLO,")){
     Peer p; memcpy(p.mac, src, 6);
     int ii=msg.indexOf("idx="), ri=msg.indexOf("room="), ti=msg.indexOf("tail="), ni=msg.indexOf("next=");
-    if (ii>0){ int c=msg.indexOf(',',ii); p.idx=(uint8_t)msg.substring(ii+4, c<0?msg.length():c).toInt(); }
+    if (ii>0){ int c=msg.indexOf(',',ii); p.idx =(uint8_t)msg.substring(ii+4, c<0?msg.length():c).toInt(); }
     if (ri>0){ int c=msg.indexOf(',',ri); p.room=(uint8_t)msg.substring(ri+5, c<0?msg.length():c).toInt(); }
     if (ti>0){ int c=msg.indexOf(',',ti); p.tail=(msg.substring(ti+5, c<0?msg.length():c).toInt()!=0); }
     if (ni>0){ int c=msg.indexOf(',',ni); p.next=msg.substring(ni+5, c<0?msg.length():c); p.next.trim(); }
-    p.last=millis();
-    bool found=false; for(auto& q:peers){ if(!memcmp(q.mac,src,6)){ q=p; found=true; break; } }
+    p.last = millis();
+
+    bool found=false;
+    for (auto& q:peers){ if(!memcmp(q.mac, src, 6)){ q=p; found=true; break; } }
     if(!found) peers.push_back(p);
     if (p.tail){ memcpy(tailMac, src, 6); haveTail=true; }
     return;
@@ -70,7 +105,7 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
         int room = tok.substring(0,dot).toInt();
         int id   = tok.substring(dot+1,at).toInt();
         int str  = tok.substring(at+1).toInt();
-        String reg = regByTag.count(id)? regByTag[id] : String("-");
+        String reg = regByTag.count(id) ? regByTag[id] : String("-");
         Serial.printf("[REPORT] tag=%d reg=%s room=%d s=%d\n", id, reg.c_str(), room, str);
       }
       p=c+1;
@@ -175,11 +210,14 @@ static void handleCLI(const String& line){
 // ---------- setup/loop ----------
 void setup(){
   Serial.begin(115200); delay(50);
-  WiFi.mode(WIFI_STA); esp_wifi_set_channel(ESPNOW_CH, WIFI_SECOND_CHAN_NONE);
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_channel(ESPNOW_CH, WIFI_SECOND_CHAN_NONE);
   if (esp_now_init()!=ESP_OK){ Serial.println("ESP-NOW init failed"); delay(3000); ESP.restart(); }
-  esp_now_register_recv_cb(onRecv); addPeer(BCAST);
+  esp_now_register_recv_cb(onRecv);
+  addPeer(BCAST);
   Serial.println("\n[UI] ready. Type 'help'.");
 }
+
 void loop(){
   static String buf;
   while(Serial.available()){
