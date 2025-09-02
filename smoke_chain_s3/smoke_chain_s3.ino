@@ -1,19 +1,10 @@
- /*
+/*
   smoke_chain_s3.ino
   ESP32-S3 "SMOKE" node for KeyGrid
-
-  - Non-tail nodes:
-      * Read BLE hits from ICE on UART1 (formats: "T,<id>,<rssi>" or "TAG <id> <rssi>")
-      * Keep strongest RSSI per tag
-      * Merge upstream aggregates from previous SMOKE; forward to next via ESP-NOW
-  - Tail node:
-      * No ICE input
-      * Outputs merged list as "UI: <room>.<tag>@<str>, ..." to UI over UART1
-      * Forwards any "CFG:..." from UI (UART1) via ESP-NOW broadcast
-  - All nodes:
-      * Receive CFG over ESP-NOW (or UART if tail) -> save to Preferences
-      * Send HELLO over ESP-NOW broadcast (mac, room, tail, next)
-      * ESPNOW channel: 6
+  - Non-tail: read ICE on UART1, keep strongest, forward via ESP-NOW
+  - Tail: no ICE; prints "UI: room.tag@str, ..." to UART1; rebroadcasts CFG
+  - All: receive CFG over ESP-NOW, persist; beacon HELLO
+  - ESPNOW channel: 6
 */
 
 #include <Arduino.h>
@@ -192,22 +183,23 @@ static void pumpUART1() {
   }
 }
 
-// ----------------- ESP-NOW callbacks -----------------
-// Arduino-ESP32 3.3.0 uses the 2-arg callback form.
-static void onRecv(const esp_now_recv_info* info, const uint8_t* data, int len) {
+// ----------------- ESP-NOW callbacks (Arduino-ESP32 3.3.0) -------------
+static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   (void)info;
   if (!data || len<=0) return;
+
   String msg; msg.reserve(len+1);
   for (int i=0;i<len;i++) msg += (char)data[i];
 
   if (msg.startsWith("CFG:")) {
-    // Optional target selector: mac=AA:BB:CC:DD:EE:FF
+    // optional target mac=...
     int macPos = msg.indexOf("mac=");
     if (macPos >= 0) {
       String m = msg.substring(macPos+4);
       int comma = m.indexOf(','); if (comma>0) m = m.substring(0, comma);
+      m.trim();                          // <-- fix: trim separately
       uint8_t tmac[6];
-      if (strToMac(m.trim(), tmac)) {
+      if (strToMac(m, tmac)) {           // <-- pass 'm', not m.trim()
         uint8_t my[6]; WiFi.macAddress(my);
         if (memcmp(tmac, my, 6) != 0) return; // not for me
       }
@@ -216,7 +208,8 @@ static void onRecv(const esp_now_recv_info* info, const uint8_t* data, int len) 
     int p = 4;
     while (p < msg.length()) {
       int c = msg.indexOf(',', p); if (c<0) c = msg.length();
-      String kv = msg.substring(p, c).trim();
+      String kv = msg.substring(p, c);   // <-- fix
+      kv.trim();                         // <-- fix
       int eq = kv.indexOf('=');
       String k = (eq>0)? kv.substring(0,eq) : kv;
       String v = (eq>0)? kv.substring(eq+1) : "1";
@@ -234,7 +227,8 @@ static void onRecv(const esp_now_recv_info* info, const uint8_t* data, int len) 
     int p = 4;
     while (p < msg.length()) {
       int c = msg.indexOf(',', p); if (c<0) c = msg.length();
-      String tok = msg.substring(p, c).trim();
+      String tok = msg.substring(p, c);  // <-- fix
+      tok.trim();                        // <-- fix
       int dot = tok.indexOf('.'); int at = tok.indexOf('@');
       if (dot>0 && at>dot) {
         int tag = tok.substring(dot+1,at).toInt();
@@ -249,9 +243,9 @@ static void onRecv(const esp_now_recv_info* info, const uint8_t* data, int len) 
   }
 }
 
-// *** 2-argument form for this core ***
+// **two-arg send callback for core 3.3.0**
 static void onSent(const uint8_t* mac, esp_now_send_status_t status) {
-  (void)mac; (void)status; // hook for debug if you want
+  (void)mac; (void)status;
 }
 
 // ----------------- Setup / Loop -----------------
@@ -260,7 +254,6 @@ void setup() {
   SICE.begin(115200, SERIAL_8N1, ICE_RX1, ICE_TX1);
 
   WiFi.mode(WIFI_STA);
-  // set channel before starting ESP-NOW
   esp_wifi_set_channel(ESPNOW_CH, WIFI_SECOND_CHAN_NONE);
 
   if (esp_now_init() != ESP_OK) {
