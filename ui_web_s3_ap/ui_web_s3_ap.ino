@@ -1,28 +1,20 @@
 /*
   ui_web_s3_ap.ino — KeyGrid UI for ESP32-S3 (Arduino-ESP32 3.x)
 
-  What it does
-  • Starts a Wi-Fi SoftAP:  SSID: KeyGrid_UI   PASS: keygrid123
-  • Hosts a single-page web app at "/"
-  • Reads UART2 from SMOKE tail (pins below) and parses:
-      - "UI: <room>.<tag>@<str>, ..." snapshots
-      - "HELLO,mac=AA:BB:...,room=N,tail=..."
-      - "LOG: ICE UNMAPPED <RAW>" (optional; shows in “Manage” for aliasing)
-  • Lets you:
-      - Rename rooms (persist /rooms.txt)
-      - Map RAW→tag (persist /alias.csv) — also sends MAP line back over UART2
-      - Set/clear registration strings per tag (persist /regs.csv)
-      - Move/forget tags (UI-local only; smoke keeps doing its job)
-
-  Hardware
-  • Board: ESP32-S3 Dev Module
-  • UART2: RX=16 (from SMOKE TX), TX=17 (to SMOKE RX; used to send MAP lines)
+  • SoftAP:  SSID KeyGrid_UI / PASS keygrid123
+  • Single-page web app at "/"
+  • UART2 from SMOKE tail (RX=16, TX=17). Parses:
+      - "UI: <room>.<tag>@<str>, ..."
+      - "HELLO,mac=..,room=..,tail=.."
+      - "LOG: ICE UNMAPPED <RAW>" (optional)
+  • Manage: rooms (/rooms.txt), aliases (/alias.csv), registrations (/regs.csv)
 */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <FS.h>
+#include <string.h>
 
 #if __has_include(<LittleFS.h>)
   #include <LittleFS.h>
@@ -117,11 +109,12 @@ static void aliasLoad(){
   f.close(); pushLog("[FS] alias loaded");
 }
 static void aliasSave(){
-  File w=FSYS.open(ALIAS_PATH,"w");
+  File w=FSYS.open(ALIAS_PATH(),"w"); // helper below
   if(!w){ pushLog("[FS] alias save fail"); return; }
   for(int i=0;i<ALIAS_MAX;i++) if(aliasMap[i].used){ w.print(aliasMap[i].raw); w.print(","); w.println(aliasMap[i].tag); }
   w.close(); pushLog("[FS] alias saved");
 }
+static inline const char* ALIAS_PATH(){ return ALIAS_PATH; } // avoid macro-capture surprises
 static int aliasFindRaw(const String& raw){ for(int i=0;i<ALIAS_MAX;i++) if(aliasMap[i].used && aliasMap[i].raw==raw) return i; return -1; }
 static void aliasSet(const String& raw, uint16_t tag){
   int i=aliasFindRaw(raw);
@@ -272,10 +265,9 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 </div>
 
 <script>
-let STATE={roomNames:[],tags:[],peers:[],logs:[],seenRaw:[]}; // tags: [{id,room,str,reg}]
+let STATE={roomNames:[],tags:[],peers:[],logs:[],seenRaw:[]};
 let FILTER="";
 
-// Tabs
 document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
   document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
   t.classList.add("active");
@@ -289,12 +281,10 @@ document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
 });
 function wrap(id,show){ document.getElementById(id).hidden=!show; }
 
-// Search
 document.getElementById("btnSearch").onclick=()=>{FILTER=Q().toUpperCase(); renderGrid();};
 document.getElementById("q").oninput=()=>{FILTER=Q().toUpperCase(); renderGrid();};
 const Q=()=>document.getElementById("q").value.trim();
 
-// Grid
 const gridEl=document.getElementById("grid");
 function renderGrid(){
   gridEl.innerHTML="";
@@ -323,7 +313,6 @@ function renderGrid(){
   }
 }
 
-// Peers & Logs
 function renderPeers(){
   const wrap=document.getElementById("wrapPeers"); wrap.innerHTML="";
   if(!STATE.peers.length){ wrap.innerHTML='<div class=row>No peers yet.</div>'; return; }
@@ -336,7 +325,6 @@ function renderLogs(){
   for(const L of STATE.logs){ wrap.appendChild(rowText(L,"mono")); }
 }
 
-// Manage
 function renderManage(){
   const RW=document.getElementById("roomsWrap"); RW.innerHTML="";
   const rooms=STATE.roomNames.length?STATE.roomNames:Array.from({length:5},(_,i)=>"Room "+(i+1));
@@ -375,7 +363,6 @@ async function aliasDel(){
   pollOnce();
 }
 
-// Drawer
 let curTag=null;
 const drawer=document.getElementById("drawer");
 const dTag=document.getElementById("dTag"), dRoom=document.getElementById("dRoom"), dStr=document.getElementById("dStr");
@@ -387,7 +374,6 @@ document.getElementById("clearReg").onclick=async()=>{ if(!curTag) return; await
 document.getElementById("doMove").onclick=async()=>{ if(!curTag) return; const r=parseInt(dMove.value||"0"); if(r>0) await post("/moveTag",{tag:curTag,room:r}); drawer.classList.remove("open"); pollOnce(); };
 document.getElementById("forgetTag").onclick=async()=>{ if(!curTag) return; await post("/forgetTag",{tag:curTag}); drawer.classList.remove("open"); pollOnce(); };
 
-// Fetch helpers
 async function post(path, obj){
   const b=new URLSearchParams(); for(const k in obj) b.append(k,obj[k]);
   await fetch(path,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:b.toString()});
@@ -396,7 +382,6 @@ function div(c,html){ const d=document.createElement("div"); if(c) d.className=c
 function rowHTML(html){ const d=div("row"); d.innerHTML=html; return d; }
 function rowText(t,extra){ const d=div("row"+(extra?(" "+extra):"")); d.textContent=t; return d; }
 
-// Poll
 async function poll(){
   try{
     const r=await fetch("/state.json",{cache:"no-store"});
@@ -428,8 +413,6 @@ static void sendStatus(){
 }
 
 // -------- HTTP handlers --------
-WebServer server(80);
-
 void handleStateJson(){
   WiFiClient client = server.client();
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -535,7 +518,6 @@ static void parseLine(String s){
     pushLog(s); return;
   }
 
-  // Accept "UI:" (or any prefix ending with ':')
   int colon=s.indexOf(':'); if(colon>=0) s=s.substring(colon+1);
 
   static bool seen[MAX_TAG_ID+1]; memset(seen,0,sizeof(seen));
@@ -581,12 +563,10 @@ void setup(){
 
   FSYS.begin(true);
   roomsLoad(); aliasLoad(); regsLoad();
-
   for(int i=1;i<=MAX_TAG_ID;i++){ tagRoom[i]=0; tagStr[i]=0; }
 
   WiFi.mode(WIFI_AP);
-  bool ok=WiFi.softAP(AP_SSID, AP_PASS);
-  (void)ok;
+  (void)WiFi.softAP(AP_SSID, AP_PASS);
   pushLog(String("[UI] AP ready: http://")+WiFi.softAPIP().toString()+"/");
 
   server.on("/", HTTP_GET, [](){ server.send_P(200,"text/html; charset=utf-8", INDEX_HTML); });
