@@ -3,11 +3,12 @@
 
   • SoftAP:  SSID KeyGrid_UI / PASS keygrid123
   • Single-page web app at "/"
-  • UART2 from SMOKE tail (RX=16, TX=17). Parses:
-      - "UI: <room>.<tag>@<str>, ..."
-      - "HELLO,mac=..,room=..,tail=.."
-      - "LOG: ICE UNMAPPED <RAW>" (optional)
-  • Manage: rooms (/rooms.txt), aliases (/alias.csv), registrations (/regs.csv)
+  • UART2 to SMOKE (RX=16, TX=17).
+  • Parses SMOKE feed and serves a UI that can:
+      - rename rooms, save rooms
+      - set/clear registrations
+      - manage RAW→Tag aliases
+      - (NEW) send CFG to SMOKE(s): make tail / set room / set next / clear
 */
 
 #include <Arduino.h>
@@ -29,7 +30,7 @@
   #define FSYS SPIFFS
 #endif
 
-// -------- Pins (match SMOKE tail UART1 pins) --------
+// -------- Pins (match SMOKE UART1 pins) --------
 #define UI_RX2 16
 #define UI_TX2 17
 
@@ -125,7 +126,7 @@ static void aliasSet(const String& raw, uint16_t tag){
   if(i>=0){ aliasMap[i].tag=tag; }
   else for(int k=0;k<ALIAS_MAX;k++) if(!aliasMap[k].used){ aliasMap[k].used=true; aliasMap[k].raw=raw; aliasMap[k].tag=tag; break; }
   aliasSave();
-  // Optional hint back to SMOKE chain (future use)
+  // Optional hint back to SMOKE chain (future)
   String line = "MAP,name=" + raw + ",id=" + String(tag);
   Serial2.println(line);
   pushLog("[MAP→SMOKE] " + line);
@@ -155,6 +156,7 @@ static void regsSave(){
 // -------- Web --------
 WebServer server(80);
 
+// NOTE: Keep R"HTML(... )HTML"; intact to avoid "unterminated raw string" compile errors.
 static const char INDEX_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
@@ -171,7 +173,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 .controls{display:grid;gap:.55rem;grid-template-columns:1fr auto;padding:.5rem .9rem .25rem}
 .input{display:flex;align-items:center;gap:.6rem;padding:.7rem .9rem;border-radius:14px;background:linear-gradient(180deg,rgba(19,26,34,.9),rgba(14,20,28,.85));border:1px solid rgba(255,255,255,.06)}
 .input input{all:unset;flex:1;font-size:15px;color:var(--text)}
-.btn{padding:.7rem 1rem;border-radius:14px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,#1a2836,#16222f);box-shadow:var(--shadow);font-weight:700;cursor:pointer}
+.btn{padding:.55rem .8rem;border-radius:12px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,#1a2836,#16222f);box-shadow:var(--shadow);font-weight:700;cursor:pointer}
 .wrap{padding:.35rem .9rem 1rem}
 .grid{display:grid;gap:.9rem;grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}
 .card{position:relative;padding:1rem .9rem .9rem;border-radius:16px;background:linear-gradient(180deg,rgba(19,26,34,.88),rgba(11,16,23,.86));border:1px solid rgba(255,255,255,.07);box-shadow:var(--shadow)}
@@ -321,9 +323,23 @@ function renderPeers(){
   const wrap=document.getElementById("wrapPeers"); wrap.innerHTML="";
   if(!STATE.peers.length){ wrap.innerHTML='<div class=row>No peers yet.</div>'; return; }
   for(const p of STATE.peers){
-    wrap.appendChild(rowHTML(`<div class="mono tag">${p.mac}</div><div>room <b>${p.room||"?"}</b></div><div class=muted>seen ${p.ago||"?"} ago</div>`));
+    const row=div("row");
+    row.appendChild(div("", `<div class="mono tag">${p.mac}</div><div>room <b>${p.room||"?"}</b></div><div class=muted>seen ${p.ago||"?"} ago</div>`));
+    const ctrls=div("", `<div style="margin-left:auto;display:flex;gap:.4rem;flex-wrap:wrap"></div>`);
+    const btnTail=button("Make tail", ()=>makeTail(p.mac));
+    const btnRoom=button("Set room", ()=>setRoom(p.mac));
+    const btnNext=button("Set next", ()=>setNext(p.mac));
+    const btnClr =button("Clear", ()=>clearNode(p.mac));
+    ctrls.firstChild?.appendChild(btnTail);
+    ctrls.firstChild?.appendChild(btnRoom);
+    ctrls.firstChild?.appendChild(btnNext);
+    ctrls.firstChild?.appendChild(btnClr);
+    row.appendChild(ctrls);
+    wrap.appendChild(row);
   }
 }
+function button(label,fn){ const b=document.createElement("button"); b.className="btn small"; b.textContent=label; b.onclick=fn; return b; }
+
 function renderLogs(){
   const wrap=document.getElementById("wrapLogs"); wrap.innerHTML="";
   for(const L of STATE.logs){ wrap.appendChild(rowText(L,"mono")); }
@@ -379,6 +395,12 @@ document.getElementById("clearReg").onclick=async()=>{ if(!curTag) return; await
 document.getElementById("doMove").onclick=async()=>{ if(!curTag) return; const r=parseInt(dMove.value||"0"); if(r>0) await post("/moveTag",{tag:curTag,room:r}); drawer.classList.remove("open"); pollOnce(); };
 document.getElementById("forgetTag").onclick=async()=>{ if(!curTag) return; await post("/forgetTag",{tag:curTag}); drawer.classList.remove("open"); pollOnce(); };
 
+// ---- NEW: CFG helpers (UI → SMOKE over UART via /cfg) ----
+async function makeTail(mac){ await post("/cfg",{mac,tail:1}); }
+async function setRoom(mac){ const r=prompt("Room # for "+mac); if(!r) return; await post("/cfg",{mac,room:r}); }
+async function setNext(mac){ const n=prompt("Next MAC for "+mac+" (AA:BB:CC:DD:EE:FF)"); if(n===null) return; await post("/cfg",{mac,next:n}); }
+async function clearNode(mac){ if(!confirm("Clear settings on "+mac+"?")) return; await post("/cfg",{mac,clear:1}); }
+
 // Fetch helpers
 async function post(path, obj){
   const b=new URLSearchParams(); for(const k in obj) b.append(k,obj[k]);
@@ -414,9 +436,6 @@ static String formValue(const String& body, const char* key){
     else o+=v[i];
   }
   return o;
-}
-static void sendStatus(){
-  pushLog(String("[AP] ")+AP_SSID+"  IP: "+WiFi.softAPIP().toString());
 }
 
 // -------- HTTP handlers --------
@@ -499,7 +518,34 @@ void handleAliasDel(){
   server.send(200,"text/plain","OK");
 }
 
-// -------- UART2 parsing --------
+// ---- NEW: /cfg -> emit a CFG line on UART toward SMOKE ----
+void handleCfg(){
+  String body = server.hasArg("plain")? server.arg("plain") : "";
+  String mac  = formValue(body,"mac");
+  String room = formValue(body,"room");
+  String tail = formValue(body,"tail");
+  String next = formValue(body,"next");
+  String clear= formValue(body,"clear");
+
+  String msg="CFG:";
+  bool first=true;
+  auto addKV=[&](const String& k,const String& v){
+    if(!v.length()) return;
+    if(!first) msg+=','; first=false;
+    msg+=k; msg+='='; msg+=v;
+  };
+  addKV("mac",mac);
+  addKV("room",room);
+  addKV("tail",tail);
+  addKV("next",next);
+  if(clear.length()){ if(!first) msg+=','; msg+="clear=1"; first=false; }
+
+  Serial2.println(msg);
+  pushLog("[UI→SMOKE] "+msg);
+  server.send(200,"text/plain","OK");
+}
+
+// -------- UART2 parsing (from SMOKE tail) --------
 volatile bool u2Flag=false; String u2Q;
 
 static void parseLine(String s){
@@ -525,7 +571,6 @@ static void parseLine(String s){
     pushLog(s); return;
   }
 
-  // Accept prefix ending with ':'
   int colon=s.indexOf(':'); if(colon>=0) s=s.substring(colon+1);
 
   static bool seen[MAX_TAG_ID+1]; memset(seen,0,sizeof(seen));
@@ -586,6 +631,7 @@ void setup(){
   server.on("/roomsSave",   HTTP_POST, handleRoomsSave);
   server.on("/aliasSet",    HTTP_POST, handleAliasSet);
   server.on("/aliasDel",    HTTP_POST, handleAliasDel);
+  server.on("/cfg",         HTTP_POST, handleCfg);            // <— NEW
   server.onNotFound([](){ server.send(404,"text/plain","404"); });
   server.begin();
 }
