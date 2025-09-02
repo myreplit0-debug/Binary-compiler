@@ -23,6 +23,9 @@
 #include <esp_now.h>
 #include <Preferences.h>
 
+// === Forward declare to satisfy Arduino's auto-prototype generator ===
+struct Agg;
+
 // ---------- Pins ----------
 #define RX1_PIN    18
 #define TX1_PIN    17
@@ -258,8 +261,7 @@ static bool espnowInit(){
   esp_wifi_set_channel(ESPNOW_CH, WIFI_SECOND_CHAN_NONE);
   if(esp_now_init()!=ESP_OK) return false;
   esp_now_register_recv_cb(onRecv);
-  // make the type match exactly (some toolchains typedef uint8_t differently)
-  esp_now_register_send_cb((esp_now_send_cb_t)onSent);
+  esp_now_register_send_cb((esp_now_send_cb_t)onSent);   // explicit cast
   addPeerIfMissing(BCAST);
   if(CFG.hasNext) addPeerIfMissing(CFG.next);
   esp_wifi_get_mac(WIFI_IF_STA, MYMAC);
