@@ -1,12 +1,3 @@
-/*
-  smoke_chain_s3.ino
-  ESP32-S3 "SMOKE" node for KeyGrid
-  - Non-tail: read ICE on UART1, keep strongest, forward via ESP-NOW
-  - Tail: no ICE; prints "UI: room.tag@str, ..." to UART1; rebroadcasts CFG
-  - All: receive CFG over ESP-NOW, persist; beacon HELLO
-  - ESPNOW channel: 6
-*/
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
@@ -33,7 +24,7 @@ static uint8_t  bestStr[MAX_TAG_ID + 1];
 static uint32_t lastHello = 0;
 static uint32_t lastFlush = 0;
 
-// ----------------- Utils -----------------
+// ---------- utils ----------
 static inline void macToStr(const uint8_t mac[6], char out[18]) {
   sprintf(out, "%02X:%02X:%02X:%02X:%02X:%02X",
           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -59,7 +50,7 @@ static inline bool macIsZero(const uint8_t mac[6]) {
   return true;
 }
 
-// ----------------- Preferences -----------------
+// ---------- prefs ----------
 void loadPrefs() {
   prefs.begin("smoke", true);
   isTail = prefs.getBool("tail", false);
@@ -78,7 +69,7 @@ void savePrefs() {
   prefs.end();
 }
 
-// ----------------- ESP-NOW basics -----------------
+// ---------- esp-now ----------
 static uint8_t bcastAddr[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
 static void sendNow(const uint8_t* mac, const char* s) {
@@ -98,7 +89,7 @@ static void ensurePeers() {
   if (!macIsZero(nextMac)) addPeer(nextMac);
 }
 
-// ----------------- HELLO -----------------
+// ---------- hello ----------
 static void sendHello() {
   uint8_t my[6]; WiFi.macAddress(my);
   char mstr[18]; macToStr(my, mstr);
@@ -110,7 +101,7 @@ static void sendHello() {
   sendNow(bcastAddr, buf);
 }
 
-// ----------------- Aggregation -----------------
+// ---------- aggregation ----------
 static void forwardAggOrPrint() {
   String out; out.reserve(256);
   out += "AGG:";
@@ -136,13 +127,12 @@ static void forwardAggOrPrint() {
     sendNow(nextMac, out.c_str());
   }
 
-  // decay
   for (int i=1;i<=MAX_TAG_ID;i++) {
     if (bestStr[i]) bestStr[i] = (bestStr[i] > 2) ? bestStr[i]-2 : 0;
   }
 }
 
-// ----------------- UART (ICE on non-tail, UI on tail) -----------------
+// ---------- uart ----------
 static bool parseTagLine(const String& line, int &tag, int &rssi) {
   if (line.length() < 5) return false;
   if (line[0]=='T') {
@@ -183,7 +173,7 @@ static void pumpUART1() {
   }
 }
 
-// ----------------- ESP-NOW callbacks (Arduino-ESP32 3.3.0) -------------
+// ---------- callbacks ----------
 static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   (void)info;
   if (!data || len<=0) return;
@@ -192,24 +182,21 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
   for (int i=0;i<len;i++) msg += (char)data[i];
 
   if (msg.startsWith("CFG:")) {
-    // optional target mac=...
     int macPos = msg.indexOf("mac=");
     if (macPos >= 0) {
       String m = msg.substring(macPos+4);
       int comma = m.indexOf(','); if (comma>0) m = m.substring(0, comma);
-      m.trim();                          // <-- fix: trim separately
+      m.trim();
       uint8_t tmac[6];
-      if (strToMac(m, tmac)) {           // <-- pass 'm', not m.trim()
+      if (strToMac(m, tmac)) {
         uint8_t my[6]; WiFi.macAddress(my);
-        if (memcmp(tmac, my, 6) != 0) return; // not for me
+        if (memcmp(tmac, my, 6) != 0) return;
       }
     }
-    // Apply keys
     int p = 4;
     while (p < msg.length()) {
       int c = msg.indexOf(',', p); if (c<0) c = msg.length();
-      String kv = msg.substring(p, c);   // <-- fix
-      kv.trim();                         // <-- fix
+      String kv = msg.substring(p, c); kv.trim();
       int eq = kv.indexOf('=');
       String k = (eq>0)? kv.substring(0,eq) : kv;
       String v = (eq>0)? kv.substring(eq+1) : "1";
@@ -227,8 +214,7 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
     int p = 4;
     while (p < msg.length()) {
       int c = msg.indexOf(',', p); if (c<0) c = msg.length();
-      String tok = msg.substring(p, c);  // <-- fix
-      tok.trim();                        // <-- fix
+      String tok = msg.substring(p, c); tok.trim();
       int dot = tok.indexOf('.'); int at = tok.indexOf('@');
       if (dot>0 && at>dot) {
         int tag = tok.substring(dot+1,at).toInt();
@@ -243,12 +229,12 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
   }
 }
 
-// **two-arg send callback for core 3.3.0**
-static void onSent(const uint8_t* mac, esp_now_send_status_t status) {
-  (void)mac; (void)status;
+// *** your toolchain expects the 3-arg form ***
+static void onSent(const uint8_t* mac, wifi_tx_info_t* tx, esp_now_send_status_t status) {
+  (void)mac; (void)tx; (void)status;
 }
 
-// ----------------- Setup / Loop -----------------
+// ---------- setup/loop ----------
 void setup() {
   Serial.begin(115200);
   SICE.begin(115200, SERIAL_8N1, ICE_RX1, ICE_TX1);
@@ -260,7 +246,7 @@ void setup() {
     Serial.println("ESP-NOW init failed"); delay(3000); ESP.restart();
   }
   esp_now_register_recv_cb(onRecv);
-  esp_now_register_send_cb(onSent);   // 2-arg signature
+  esp_now_register_send_cb(onSent);
 
   loadPrefs();
   ensurePeers();
