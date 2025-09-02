@@ -2,6 +2,7 @@
 // - Filters to registered tags only (MAP from UI).
 // - Aggregates local+downstream best per tag; forwards in TDMA slot.
 // - REPORT tokens carry room that observed the best signal.
+// - Improvements: dynamic active set, chunked REPORT frames, and amTail fallback.
 //
 // Build FQBN: esp32:esp32:esp32s3
 
@@ -15,10 +16,11 @@
 
 #define ESPNOW_CH 6
 #define MAX_TAG_ID 2048          // up to 2048 tag IDs
-#define FRAME_MS   800           // TDMA frame; slot = FRAME_MS / slots (min-clamped)
-#define MIN_SLOT   30            // ms, safety lower bound
+#define FRAME_MS   800           // TDMA frame
+#define MIN_SLOT   30            // ms, lower bound
+#define MAX_REPORT_BYTES 220     // safe ESP-NOW payload budget per REPORT chunk
 
-// ICE UART1 on S3 (explicit pins)
+// ICE UART1 pins on S3
 #define ICE_RX1 16
 #define ICE_TX1 17
 HardwareSerial &SICE = Serial1;
@@ -36,7 +38,7 @@ static uint8_t rssiToStrength(int rssi){ if(rssi>-30) rssi=-30; if(rssi<-100) rs
 Preferences prefs;
 static uint8_t nextMac[6]={0};   // upstream hop toward tail
 static uint8_t idx=1;            // chain slot index (1..N)
-static uint8_t slots=8;          // total slots (from UI); dynamic
+static uint8_t slots=8;          // total slots (from UI)
 static uint8_t roomNo=0;         // 0..255
 static bool    isTail=false;
 
@@ -63,7 +65,6 @@ static void savePrefs(){
 // ---------- registry & aggregation ----------
 static std::unordered_map<String,uint16_t> raw2id; // RAW name -> tag id
 
-// Best across local + downstream
 static uint8_t bestStr [MAX_TAG_ID+1]; // 0..100
 static uint8_t bestRoom[MAX_TAG_ID+1]; // 0..255 (room that produced bestStr)
 
@@ -78,8 +79,6 @@ static inline void updateBest(uint16_t id, uint8_t str, uint8_t room){
   if (id==0 || id>MAX_TAG_ID || str==0) return;
   if (str >= bestStr[id]) { bestStr[id]=str; bestRoom[id]=room; touchActive(id); }
 }
-
-// Decay + compact active list
 static void decayAndCompact(){
   if (activeIds.empty()) return;
   std::vector<uint16_t> keep; keep.reserve(activeIds.size());
@@ -102,19 +101,30 @@ static void sendHello(){
   s += ",idx="+String(idx)+",room="+String(roomNo)+",tail="+String(isTail?1:0)+",next="+String(nxt);
   sendNow(BCAST,s); if(uiKnown) sendNow(uiMac,s);
 }
+
+// Chunked REPORT with room.tag@str tokens
 static void sendReport(){
   if (activeIds.empty()) return;
+
+  auto flushChunk = [&](String& out){
+    if (out.length()<=7) return; // "REPORT:" only
+    bool amTail = isTail || macIsZero(nextMac); // **amTail improvement**
+    if (amTail){ if (uiKnown) sendNow(uiMac,out); }
+    else if (!macIsZero(nextMac)){ sendNow(nextMac,out); }
+    else { sendNow(BCAST,out); }
+    out = "REPORT:";
+  };
+
   String out="REPORT:"; bool first=true;
   for (uint16_t id: activeIds){
     uint8_t s = bestStr[id]; if (!s) continue;
-    if (!first) out+=','; first=false;
     uint8_t r = bestRoom[id] ? bestRoom[id] : roomNo;
-    out += String((int)r)+"."+String((int)id)+'@'+String((int)s);
+    String tok = String((int)r)+"."+String((int)id)+'@'+String((int)s);
+    int add = (first?0:1) + tok.length();
+    if (out.length() + add > MAX_REPORT_BYTES) { flushChunk(out); first=true; }
+    if (!first) out+=','; first=false; out+=tok;
   }
-  if (first) return;
-  if (isTail){ if (uiKnown) sendNow(uiMac,out); }
-  else if (!macIsZero(nextMac)) sendNow(nextMac,out);
-  else sendNow(BCAST,out); // fallback when chain not set
+  flushChunk(out);
 }
 
 static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len){
@@ -139,7 +149,6 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
   }
 
   if (msg.startsWith("MAP,")){
-    // MAP,name=RAW,id=N
     int ni=msg.indexOf("name="), ii=msg.indexOf("id=");
     if (ni>0 && ii>0){
       int nc=msg.indexOf(',',ni+5); if(nc<0) nc=msg.length();
@@ -167,7 +176,6 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
       }
       p=c+1;
     }
-    // Non-tail will forward its unified report in its own slot.
     return;
   }
 }
@@ -179,7 +187,7 @@ static void pumpICE(){
     char ch=(char)SICE.read();
     if (ch=='\n'){
       String s=line; line=""; s.trim(); if(!s.length()) continue;
-      // RAW,<name>,<rssi>  OR  MAC,<aa:bb:..>,<rssi> (MAC mapping optional; only RAW used here)
+      // RAW,<name>,<rssi>  OR  MAC,<aa:bb:..>,<rssi> (MAC mapping optional)
       if (s.startsWith("RAW,")){
         int a=s.indexOf(',',4); if(a>0){
           String name=s.substring(4,a); name.trim();
@@ -191,7 +199,7 @@ static void pumpICE(){
           }
         }
       }
-      // else if (s.startsWith("MAC,")) { /* add MAC->id mapping if you need it */ }
+      // else if (s.startsWith("MAC,")) { /* add MAC->id mapping if you want */ }
     } else if (ch!='\r'){
       line+=ch; if(line.length()>256) line.remove(0,64);
     }
@@ -218,10 +226,8 @@ void setup(){
 void loop(){
   pumpICE();
 
-  // periodic HELLO
   static uint32_t lastHello=0; if (millis()-lastHello>2000){ lastHello=millis(); sendHello(); }
 
-  // TDMA frame + slot scheduling
   static uint32_t nextFrame=0;
   uint16_t slotMs = (uint16_t)max((int)MIN_SLOT, (int)(FRAME_MS / max((int)slots,1)));
   if ((int32_t)(millis()-nextFrame) >= 0){
@@ -229,9 +235,8 @@ void loop(){
     uint32_t frameStart = now - (now % FRAME_MS);
     nextFrame = frameStart + FRAME_MS;
 
-    // our slot: (idx-1) * slotMs inside frame
     uint32_t slotAt = frameStart + ((uint32_t)(idx-1) * slotMs);
-    if ((int32_t)(slotAt - now) < 0) slotAt += FRAME_MS; // if already passed, push to next frame
+    if ((int32_t)(slotAt - now) < 0) slotAt += FRAME_MS;
     while ((int32_t)(millis()-slotAt) < 0) delay(1);
 
     sendReport();
