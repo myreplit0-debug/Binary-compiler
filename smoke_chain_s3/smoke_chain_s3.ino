@@ -4,27 +4,37 @@
 #include <esp_now.h>
 #include <Preferences.h>
 
+// -------------------- wiring / roles --------------------
 #define ESPNOW_CH        6
+
+// UI <-> TAIL UART (tail only; hard-wired to UI)
+#define UI_RX2           16
+#define UI_TX2           17
+
+// ICE <-> NON-TAIL UART (non-tail only; hard-wired to ICE)
 #define ICE_RX1          16
 #define ICE_TX1          17
+
 #define MAX_TAG_ID       1024
 #define HELLO_PERIOD_MS  2000
 #define FLUSH_PERIOD_MS  600
 #define ICE_READ_BUDGET  48
 
+// -------------------- globals --------------------
 Preferences prefs;
-bool     isTail  = false;
-uint8_t  roomNo  = 0;
-uint8_t  nextMac[6] = {0};
+bool     isTail  = false;          // true on the unit plugged into the UI
+uint8_t  roomNo  = 0;              // 0 == unassigned
+uint8_t  nextMac[6] = {0};         // upstream (toward tail). For tail this may be 00s.
 
-HardwareSerial &SICE = Serial1;
-String iceLine;
+HardwareSerial &SICE = Serial1;    // ICE UART (non-tail)
+HardwareSerial &SUI  = Serial2;    // UI  UART (tail)
+String lineBuf;                    // reused for whichever UART is active
 
-static uint8_t  bestStr[MAX_TAG_ID + 1];
+static uint8_t  bestStr[MAX_TAG_ID + 1];  // rolling maxima/decay for AGG
 static uint32_t lastHello = 0;
 static uint32_t lastFlush = 0;
 
-// ---------- utils ----------
+// -------------------- utils --------------------
 static inline void macToStr(const uint8_t mac[6], char out[18]) {
   sprintf(out, "%02X:%02X:%02X:%02X:%02X:%02X",
           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -37,21 +47,21 @@ static inline bool strToMac(const String &s, uint8_t mac[6]) {
   for (int i = 0; i < 6; i++) mac[i] = (uint8_t)b[i];
   return true;
 }
+static inline bool macIsZero(const uint8_t mac[6]) {
+  for (int i=0;i<6;i++) if (mac[i]) return false;
+  return true;
+}
 static inline uint8_t rssiToStrength(int rssi) {
-  if (rssi > -30) rssi = -30;
+  if (rssi > -30)  rssi = -30;
   if (rssi < -100) rssi = -100;
   int v = (rssi + 100) * (100.0 / 70.0) + 0.5;
   if (v < 0) v = 0;
   if (v > 100) v = 100;
   return (uint8_t)v;
 }
-static inline bool macIsZero(const uint8_t mac[6]) {
-  for (int i=0;i<6;i++) if (mac[i]) return false;
-  return true;
-}
 
-// ---------- prefs ----------
-void loadPrefs() {
+// -------------------- prefs --------------------
+static void loadPrefs() {
   prefs.begin("smoke", true);
   isTail = prefs.getBool("tail", false);
   roomNo = prefs.getUChar("room", 0);
@@ -60,8 +70,7 @@ void loadPrefs() {
   if (ns.length()==17) strToMac(ns, nextMac);
   else memset(nextMac, 0, 6);
 }
-
-void savePrefs() {
+static void savePrefs() {
   char nbuf[18]; macToStr(nextMac, nbuf);
   prefs.begin("smoke", false);
   prefs.putBool("tail", isTail);
@@ -70,7 +79,7 @@ void savePrefs() {
   prefs.end();
 }
 
-// ---------- esp-now ----------
+// -------------------- ESP-NOW --------------------
 static uint8_t bcastAddr[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
 static void sendNow(const uint8_t* mac, const char* s) {
@@ -90,7 +99,7 @@ static void ensurePeers() {
   if (!macIsZero(nextMac)) addPeer(nextMac);
 }
 
-// ---------- hello ----------
+// -------------------- HELLO beacons --------------------
 static void sendHello() {
   uint8_t my[6]; WiFi.macAddress(my);
   char mstr[18]; macToStr(my, mstr);
@@ -102,8 +111,9 @@ static void sendHello() {
   sendNow(bcastAddr, buf);
 }
 
-// ---------- aggregation ----------
+// -------------------- aggregation & flushing --------------------
 static void forwardAggOrPrint() {
+  // Build AGG line from current bestStr[]
   String out; out.reserve(256);
   out += "AGG:";
   bool first = true;
@@ -119,22 +129,28 @@ static void forwardAggOrPrint() {
   }
 
   if (isTail) {
+    // Tail prints UI-friendly line to the UI UART
     if (out.length() > 4) {
       String ui = "UI: " + out.substring(4);
-      SICE.println(ui);
+      SUI.println(ui);
     }
-  } else if (!macIsZero(nextMac)) {
-    ensurePeers();
-    sendNow(nextMac, out.c_str());
+  } else {
+    // non-tail forwards upstream toward the tail
+    if (!macIsZero(nextMac)) {
+      ensurePeers();
+      sendNow(nextMac, out.c_str());
+    }
   }
 
+  // gentle decay to keep the grid responsive
   for (int i=1;i<=MAX_TAG_ID;i++) {
     if (bestStr[i]) bestStr[i] = (bestStr[i] > 2) ? bestStr[i]-2 : 0;
   }
 }
 
-// ---------- uart ----------
+// -------------------- ICE UART parsing (non-tail nodes) --------------------
 static bool parseTagLine(const String& line, int &tag, int &rssi) {
+  // Accept either "T,<id>,<rssi>" or "TAG <id> <rssi>"
   if (line.length() < 5) return false;
   if (line[0]=='T') {
     int a=line.indexOf(','); if (a<0) return false;
@@ -150,31 +166,48 @@ static bool parseTagLine(const String& line, int &tag, int &rssi) {
   }
   return false;
 }
-static void pumpUART1() {
+static void pumpICE() {
   int budget = ICE_READ_BUDGET;
   while (budget-- > 0 && SICE.available()) {
     char c = (char)SICE.read();
     if (c=='\n') {
-      String s = iceLine; iceLine = ""; s.trim();
+      String s = lineBuf; lineBuf = ""; s.trim();
       if (!s.length()) continue;
 
-      if (isTail) {
-        if (s.startsWith("CFG:")) { ensurePeers(); sendNow(bcastAddr, s.c_str()); }
-      } else {
-        int tag, rssi;
-        if (parseTagLine(s, tag, rssi)) {
-          uint8_t st = rssiToStrength(rssi);
-          if (tag>=1 && tag<=MAX_TAG_ID && st>bestStr[tag]) bestStr[tag] = st;
-        }
+      int tag, rssi;
+      if (parseTagLine(s, tag, rssi)) {
+        uint8_t st = rssiToStrength(rssi);
+        if (tag>=1 && tag<=MAX_TAG_ID && st>bestStr[tag]) bestStr[tag] = st;
       }
     } else if (c!='\r') {
-      iceLine += c;
-      if (iceLine.length() > 256) iceLine.remove(0, 64);
+      lineBuf += c;
+      if (lineBuf.length() > 256) lineBuf.remove(0, 64);
     }
   }
 }
 
-// ---------- callbacks ----------
+// -------------------- UI UART handling (tail node) --------------------
+static void pumpUI() {
+  while (SUI.available()) {
+    char c = (char)SUI.read();
+    if (c=='\n') {
+      String s = lineBuf; lineBuf = ""; s.trim();
+      if (!s.length()) continue;
+
+      // UI sends CFG:... via UART2; rebroadcast to fleet
+      if (s.startsWith("CFG:")) {
+        ensurePeers();
+        sendNow(bcastAddr, s.c_str());
+      }
+      // (Optionally ignore anything else)
+    } else if (c!='\r') {
+      lineBuf += c;
+      if (lineBuf.length() > 256) lineBuf.remove(0, 64);
+    }
+  }
+}
+
+// -------------------- ESP-NOW callbacks --------------------
 static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
   (void)info;
   if (!data || len<=0) return;
@@ -183,6 +216,7 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
   for (int i=0;i<len;i++) msg += (char)data[i];
 
   if (msg.startsWith("CFG:")) {
+    // Optional targeting: CFG:mac=AA:..:..,room=..,tail=..,next=..,clear=1
     int macPos = msg.indexOf("mac=");
     if (macPos >= 0) {
       String m = msg.substring(macPos+4);
@@ -191,9 +225,10 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
       uint8_t tmac[6];
       if (strToMac(m, tmac)) {
         uint8_t my[6]; WiFi.macAddress(my);
-        if (memcmp(tmac, my, 6) != 0) return;
+        if (memcmp(tmac, my, 6) != 0) return; // not for me
       }
     }
+    // Apply keys that exist
     int p = 4;
     while (p < msg.length()) {
       int c = msg.indexOf(',', p); if (c<0) c = msg.length();
@@ -201,17 +236,39 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
       int eq = kv.indexOf('=');
       String k = (eq>0)? kv.substring(0,eq) : kv;
       String v = (eq>0)? kv.substring(eq+1) : "1";
+
       if      (k=="room")  { int r=v.toInt(); if (r>=0 && r<=255) roomNo=(uint8_t)r; }
       else if (k=="tail")  { isTail = (v.toInt()!=0); }
       else if (k=="next")  { if (!strToMac(v, nextMac)) memset(nextMac,0,6); }
-      else if (k=="clear") { isTail=false; roomNo=0; memset(nextMac,0,6); }
+      else if (k=="clear") { isTail=false; roomNo=0; memset(nextMac,0,6); memset(bestStr,0,sizeof(bestStr)); }
+
       p = c+1;
     }
     savePrefs();
+
+    // If we just became tail, ICE UART is irrelevant and UI UART is needed.
+    // If we just left tail, UI UART is irrelevant and ICE UART is needed.
+    // Reconfigure UARTs lazily on role change:
+    static bool lastTail = !isTail; // force first pass
+    if (lastTail != isTail) {
+      lastTail = isTail;
+      if (isTail) {
+        SUI.end();
+        delay(5);
+        SUI.begin(115200, SERIAL_8N1, UI_RX2, UI_TX2);
+        SICE.end(); // ensure ICE port is off
+      } else {
+        SICE.end();
+        delay(5);
+        SICE.begin(115200, SERIAL_8N1, ICE_RX1, ICE_TX1);
+        SUI.end();  // ensure UI port is off
+      }
+    }
     return;
   }
 
   if (msg.startsWith("AGG:")) {
+    // Integrate upstream strengths (room is in the token but not needed here)
     int p = 4;
     while (p < msg.length()) {
       int c = msg.indexOf(',', p); if (c<0) c = msg.length();
@@ -230,15 +287,25 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
   }
 }
 
-// *** send callback expected by your core: 2 args ***
+// Signature expected by current ESP32 core (two params; first is wifi_tx_info_t*)
 static void onSent(const wifi_tx_info_t* tx_info, esp_now_send_status_t status) {
   (void)tx_info; (void)status;
 }
 
-// ---------- setup/loop ----------
+// -------------------- setup / loop --------------------
 void setup() {
   Serial.begin(115200);
-  SICE.begin(115200, SERIAL_8N1, ICE_RX1, ICE_TX1);
+
+  // Load role & wiring first, so we can bring up the correct UART
+  loadPrefs();
+
+  if (isTail) {
+    // Tail talks to the UI over UART2; no ICE attached
+    SUI.begin(115200, SERIAL_8N1, UI_RX2, UI_TX2);
+  } else {
+    // Non-tail talks to ICE over UART1
+    SICE.begin(115200, SERIAL_8N1, ICE_RX1, ICE_TX1);
+  }
 
   WiFi.mode(WIFI_STA);
   esp_wifi_set_channel(ESPNOW_CH, WIFI_SECOND_CHAN_NONE);
@@ -249,7 +316,6 @@ void setup() {
   esp_now_register_recv_cb(onRecv);
   esp_now_register_send_cb(onSent);
 
-  loadPrefs();
   ensurePeers();
   memset(bestStr, 0, sizeof(bestStr));
 
@@ -259,7 +325,12 @@ void setup() {
 }
 
 void loop() {
-  pumpUART1();
+  if (isTail) {
+    pumpUI();     // listen for CFG: from UI
+  } else {
+    pumpICE();    // read ICE -> produce strengths
+  }
+
   uint32_t now = millis();
   if (now - lastHello >= HELLO_PERIOD_MS) { lastHello = now; sendHello(); }
   if (now - lastFlush >= FLUSH_PERIOD_MS) { lastFlush = now; forwardAggOrPrint(); }
