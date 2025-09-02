@@ -1,4 +1,4 @@
-/*
+ /*
   smoke_chain_s3.ino
   ESP32-S3 "SMOKE" node for KeyGrid
 
@@ -9,7 +9,7 @@
   - Tail node:
       * No ICE input
       * Outputs merged list as "UI: <room>.<tag>@<str>, ..." to UI over UART1
-      * Forwards any "CFG:..." coming from UI (UART1) via ESP-NOW broadcast
+      * Forwards any "CFG:..." from UI (UART1) via ESP-NOW broadcast
   - All nodes:
       * Receive CFG over ESP-NOW (or UART if tail) -> save to Preferences
       * Send HELLO over ESP-NOW broadcast (mac, room, tail, next)
@@ -18,8 +18,8 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_now.h>
 #include <Preferences.h>
 
 #define ESPNOW_CH        6
@@ -31,17 +31,18 @@
 #define ICE_READ_BUDGET  48
 
 Preferences prefs;
-bool isTail = false;
-uint8_t roomNo = 0;
-uint8_t nextMac[6] = {0};
+bool     isTail  = false;
+uint8_t  roomNo  = 0;
+uint8_t  nextMac[6] = {0};
 
 HardwareSerial &SICE = Serial1;
 String iceLine;
 
-static uint8_t bestStr[MAX_TAG_ID + 1];
+static uint8_t  bestStr[MAX_TAG_ID + 1];
 static uint32_t lastHello = 0;
 static uint32_t lastFlush = 0;
 
+// ----------------- Utils -----------------
 static inline void macToStr(const uint8_t mac[6], char out[18]) {
   sprintf(out, "%02X:%02X:%02X:%02X:%02X:%02X",
           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -63,17 +64,18 @@ static inline uint8_t rssiToStrength(int rssi) {
   return (uint8_t)v;
 }
 static inline bool macIsZero(const uint8_t mac[6]) {
-  for (int i = 0; i < 6; i++) if (mac[i] != 0) return false;
+  for (int i=0;i<6;i++) if (mac[i]) return false;
   return true;
 }
 
+// ----------------- Preferences -----------------
 void loadPrefs() {
   prefs.begin("smoke", true);
   isTail = prefs.getBool("tail", false);
   roomNo = prefs.getUChar("room", 0);
   String ns = prefs.getString("next", "");
   prefs.end();
-  if (ns.length() == 17) strToMac(ns, nextMac);
+  if (ns.length()==17) strToMac(ns, nextMac);
   else memset(nextMac, 0, 6);
 }
 void savePrefs() {
@@ -85,11 +87,13 @@ void savePrefs() {
   prefs.end();
 }
 
+// ----------------- ESP-NOW basics -----------------
 static uint8_t bcastAddr[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-void sendNow(const uint8_t* mac, const char* s) {
+
+static void sendNow(const uint8_t* mac, const char* s) {
   esp_now_send(mac, (const uint8_t*)s, strlen(s));
 }
-bool addPeer(const uint8_t mac[6]) {
+static bool addPeer(const uint8_t mac[6]) {
   if (macIsZero(mac)) return false;
   esp_now_peer_info_t p = {};
   memcpy(p.peer_addr, mac, 6);
@@ -98,12 +102,13 @@ bool addPeer(const uint8_t mac[6]) {
   if (esp_now_is_peer_exist(mac)) return true;
   return esp_now_add_peer(&p) == ESP_OK;
 }
-void ensurePeers() {
+static void ensurePeers() {
   addPeer(bcastAddr);
   if (!macIsZero(nextMac)) addPeer(nextMac);
 }
 
-void sendHello() {
+// ----------------- HELLO -----------------
+static void sendHello() {
   uint8_t my[6]; WiFi.macAddress(my);
   char mstr[18]; macToStr(my, mstr);
   char nstr[18]; macToStr(nextMac, nstr);
@@ -114,11 +119,12 @@ void sendHello() {
   sendNow(bcastAddr, buf);
 }
 
-void forwardAggOrPrint() {
+// ----------------- Aggregation -----------------
+static void forwardAggOrPrint() {
   String out; out.reserve(256);
   out += "AGG:";
   bool first = true;
-  for (int i = 1; i <= MAX_TAG_ID; i++) {
+  for (int i=1;i<=MAX_TAG_ID;i++) {
     uint8_t s = bestStr[i];
     if (s) {
       if (!first) out += ',';
@@ -128,6 +134,7 @@ void forwardAggOrPrint() {
       out += String((int)s);
     }
   }
+
   if (isTail) {
     if (out.length() > 4) {
       String ui = "UI: " + out.substring(4);
@@ -137,85 +144,86 @@ void forwardAggOrPrint() {
     ensurePeers();
     sendNow(nextMac, out.c_str());
   }
-  for (int i = 1; i <= MAX_TAG_ID; i++) {
-    if (bestStr[i] > 0) bestStr[i] = (bestStr[i] > 2) ? bestStr[i]-2 : 0;
+
+  // decay
+  for (int i=1;i<=MAX_TAG_ID;i++) {
+    if (bestStr[i]) bestStr[i] = (bestStr[i] > 2) ? bestStr[i]-2 : 0;
   }
 }
 
-bool parseTagLine(const String& line, int &tag, int &rssi) {
+// ----------------- UART (ICE on non-tail, UI on tail) -----------------
+static bool parseTagLine(const String& line, int &tag, int &rssi) {
   if (line.length() < 5) return false;
-  if (line[0] == 'T') {
-    int a = line.indexOf(','); if (a < 0) return false;
-    int b = line.indexOf(',', a+1); if (b < 0) return false;
+  if (line[0]=='T') {
+    int a=line.indexOf(','); if (a<0) return false;
+    int b=line.indexOf(',', a+1); if (b<0) return false;
     tag = line.substring(a+1, b).toInt();
-    rssi = line.substring(b+1).toInt();
-    return tag > 0;
+    rssi= line.substring(b+1).toInt();
+    return tag>0;
   } else if (line.startsWith("TAG ")) {
-    int a = line.indexOf(' ', 4); if (a < 0) return false;
+    int a=line.indexOf(' ',4); if (a<0) return false;
     tag = line.substring(4, a).toInt();
-    rssi = line.substring(a+1).toInt();
-    return tag > 0;
+    rssi= line.substring(a+1).toInt();
+    return tag>0;
   }
   return false;
 }
-
-void pumpUART1() {
+static void pumpUART1() {
   int budget = ICE_READ_BUDGET;
   while (budget-- > 0 && SICE.available()) {
     char c = (char)SICE.read();
-    if (c == '\n') {
-      String s = iceLine; iceLine = "";
-      s.trim();
+    if (c=='\n') {
+      String s = iceLine; iceLine = ""; s.trim();
       if (!s.length()) continue;
 
       if (isTail) {
-        if (s.startsWith("CFG:")) {
-          ensurePeers();
-          sendNow(bcastAddr, s.c_str());
-        }
+        if (s.startsWith("CFG:")) { ensurePeers(); sendNow(bcastAddr, s.c_str()); }
       } else {
         int tag, rssi;
         if (parseTagLine(s, tag, rssi)) {
           uint8_t st = rssiToStrength(rssi);
-          if (tag >= 1 && tag <= MAX_TAG_ID && st > bestStr[tag]) bestStr[tag] = st;
+          if (tag>=1 && tag<=MAX_TAG_ID && st>bestStr[tag]) bestStr[tag] = st;
         }
       }
-    } else if (c != '\r') {
+    } else if (c!='\r') {
       iceLine += c;
       if (iceLine.length() > 256) iceLine.remove(0, 64);
     }
   }
 }
 
-// ---- ESP-NOW callbacks (IDF v5 / Arduino 3.3.0 signatures) ----
-void onRecv(const esp_now_recv_info* info, const uint8_t* data, int len) {
+// ----------------- ESP-NOW callbacks -----------------
+// Arduino-ESP32 3.3.0 uses the 2-arg callback form.
+static void onRecv(const esp_now_recv_info* info, const uint8_t* data, int len) {
   (void)info;
-  if (!data || len <= 0) return;
+  if (!data || len<=0) return;
   String msg; msg.reserve(len+1);
-  for (int i=0; i<len; i++) msg += (char)data[i];
+  for (int i=0;i<len;i++) msg += (char)data[i];
 
   if (msg.startsWith("CFG:")) {
+    // Optional target selector: mac=AA:BB:CC:DD:EE:FF
     int macPos = msg.indexOf("mac=");
     if (macPos >= 0) {
       String m = msg.substring(macPos+4);
-      int comma = m.indexOf(','); if (comma > 0) m = m.substring(0, comma);
-      m.trim();
-      uint8_t tmac[6]; if (strToMac(m, tmac)) {
+      int comma = m.indexOf(','); if (comma>0) m = m.substring(0, comma);
+      uint8_t tmac[6];
+      if (strToMac(m.trim(), tmac)) {
         uint8_t my[6]; WiFi.macAddress(my);
         if (memcmp(tmac, my, 6) != 0) return; // not for me
       }
     }
+    // Apply keys
     int p = 4;
     while (p < msg.length()) {
-      int c = msg.indexOf(',', p); if (c < 0) c = msg.length();
-      String kv = msg.substring(p, c); kv.trim();
+      int c = msg.indexOf(',', p); if (c<0) c = msg.length();
+      String kv = msg.substring(p, c).trim();
       int eq = kv.indexOf('=');
-      String k = (eq > 0)? kv.substring(0,eq) : kv;
-      String v = (eq > 0)? kv.substring(eq+1) : "1";
-      if (k == "room")       { int r = v.toInt(); if (r>=0 && r<=255) roomNo = (uint8_t)r; }
-      else if (k == "tail")  { isTail = (v.toInt()!=0); }
-      else if (k == "next")  { if (!strToMac(v, nextMac)) memset(nextMac, 0, 6); }
-      else if (k == "clear") { isTail = false; roomNo = 0; memset(nextMac,0,6); }
+      String k = (eq>0)? kv.substring(0,eq) : kv;
+      String v = (eq>0)? kv.substring(eq+1) : "1";
+      if      (k=="room")  { int r=v.toInt(); if (r>=0 && r<=255) roomNo=(uint8_t)r; }
+      else if (k=="tail")  { isTail = (v.toInt()!=0); }
+      else if (k=="next")  { if (!strToMac(v, nextMac)) memset(nextMac,0,6); }
+      else if (k=="clear") { isTail=false; roomNo=0; memset(nextMac,0,6); }
       p = c+1;
     }
     savePrefs();
@@ -226,14 +234,14 @@ void onRecv(const esp_now_recv_info* info, const uint8_t* data, int len) {
     int p = 4;
     while (p < msg.length()) {
       int c = msg.indexOf(',', p); if (c<0) c = msg.length();
-      String tok = msg.substring(p, c); tok.trim();
+      String tok = msg.substring(p, c).trim();
       int dot = tok.indexOf('.'); int at = tok.indexOf('@');
-      if (dot > 0 && at > dot) {
+      if (dot>0 && at>dot) {
         int tag = tok.substring(dot+1,at).toInt();
         int str = tok.substring(at+1).toInt();
         if (tag>=1 && tag<=MAX_TAG_ID) {
           if (str<0) str=0; if (str>100) str=100;
-          if (str > bestStr[tag]) bestStr[tag] = (uint8_t)str;
+          if (str>bestStr[tag]) bestStr[tag] = (uint8_t)str;
         }
       }
       p = c+1;
@@ -241,32 +249,33 @@ void onRecv(const esp_now_recv_info* info, const uint8_t* data, int len) {
   }
 }
 
-// *** FIXED signature here ***
-void onSent(const uint8_t* mac_addr, wifi_tx_info_t* tx, esp_now_send_status_t status) {
-  (void)mac_addr; (void)tx; (void)status;
+// *** 2-argument form for this core ***
+static void onSent(const uint8_t* mac, esp_now_send_status_t status) {
+  (void)mac; (void)status; // hook for debug if you want
 }
 
+// ----------------- Setup / Loop -----------------
 void setup() {
   Serial.begin(115200);
   SICE.begin(115200, SERIAL_8N1, ICE_RX1, ICE_TX1);
 
   WiFi.mode(WIFI_STA);
+  // set channel before starting ESP-NOW
   esp_wifi_set_channel(ESPNOW_CH, WIFI_SECOND_CHAN_NONE);
 
-  if (esp_now_init()!=ESP_OK) {
+  if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW init failed"); delay(3000); ESP.restart();
   }
   esp_now_register_recv_cb(onRecv);
-  esp_now_register_send_cb(onSent);
+  esp_now_register_send_cb(onSent);   // 2-arg signature
 
   loadPrefs();
   ensurePeers();
   memset(bestStr, 0, sizeof(bestStr));
 
-  Serial.println("[SMOKE] boot");
   uint8_t me[6]; WiFi.macAddress(me);
   char macs[18]; macToStr(me, macs);
-  Serial.printf("[SMOKE] mac=%s room=%u tail=%u\n", macs, roomNo, isTail?1:0);
+  Serial.printf("[SMOKE] boot mac=%s room=%u tail=%u\n", macs, roomNo, isTail?1:0);
 }
 
 void loop() {
