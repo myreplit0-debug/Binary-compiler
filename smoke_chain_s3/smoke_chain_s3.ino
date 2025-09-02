@@ -229,9 +229,9 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
   }
 }
 
-// *** your toolchain expects the 3-arg form ***
-static void onSent(const uint8_t* mac, wifi_tx_info_t* tx, esp_now_send_status_t status) {
-  (void)mac; (void)tx; (void)status;
+// *** send callback expected by your core: 2 args, first is wifi_tx_info_t* ***
+static void onSent(const wifi_tx_info_t* tx_info, esp_now_send_status_t status) {
+  (void)tx_info; (void)status;
 }
 
 // ---------- setup/loop ----------
