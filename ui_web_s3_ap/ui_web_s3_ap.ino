@@ -3,12 +3,12 @@
 
   • SoftAP:  SSID KeyGrid_UI / PASS keygrid123
   • Single-page web app at "/"
-  • UART2 to SMOKE (RX=16, TX=17).
-  • Parses SMOKE feed and serves a UI that can:
-      - rename rooms, save rooms
-      - set/clear registrations
-      - manage RAW→Tag aliases
-      - (NEW) send CFG to SMOKE(s): make tail / set room / set next / clear
+  • UART2 from SMOKE tail (RX=16, TX=17). Parses:
+      - "UI: <room>.<tag>@<str>, ..."
+      - "HELLO,mac=..,room=..,tail=..,next=.."
+      - "LOG: ICE UNMAPPED <RAW>" (optional)
+  • Manage: rooms (/rooms.txt), aliases (/alias.csv), registrations (/regs.csv)
+  • NEW: /cfg endpoint + Peers actions (Make Tail, Tail Off, Set Room, Set Next, Clear)
 */
 
 #include <Arduino.h>
@@ -30,7 +30,7 @@
   #define FSYS SPIFFS
 #endif
 
-// -------- Pins (match SMOKE UART1 pins) --------
+// -------- Pins (match SMOKE tail UART1 pins) --------
 #define UI_RX2 16
 #define UI_TX2 17
 
@@ -57,7 +57,7 @@ uint16_t tagRoom[MAX_TAG_ID + 1];   // 0 = not shown
 uint8_t  tagStr [MAX_TAG_ID + 1];   // 0..100
 String   regByTag[MAX_TAG_ID + 1];  // "" if none
 
-struct PeerInfo { String mac; int room; uint32_t lastMs; };
+struct PeerInfo { String mac; int room; uint8_t tail; String next; uint32_t lastMs; };
 PeerInfo peers[MAX_PEERS]; int peerCount=0;
 
 struct AliasEntry { String raw; uint16_t tag; bool used; };
@@ -126,7 +126,7 @@ static void aliasSet(const String& raw, uint16_t tag){
   if(i>=0){ aliasMap[i].tag=tag; }
   else for(int k=0;k<ALIAS_MAX;k++) if(!aliasMap[k].used){ aliasMap[k].used=true; aliasMap[k].raw=raw; aliasMap[k].tag=tag; break; }
   aliasSave();
-  // Optional hint back to SMOKE chain (future)
+  // Hint to chain/ICE via tail: emit MAP on UART2 (tail should forward to ICE)
   String line = "MAP,name=" + raw + ",id=" + String(tag);
   Serial2.println(line);
   pushLog("[MAP→SMOKE] " + line);
@@ -156,7 +156,6 @@ static void regsSave(){
 // -------- Web --------
 WebServer server(80);
 
-// NOTE: Keep R"HTML(... )HTML"; intact to avoid "unterminated raw string" compile errors.
 static const char INDEX_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
@@ -173,7 +172,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 .controls{display:grid;gap:.55rem;grid-template-columns:1fr auto;padding:.5rem .9rem .25rem}
 .input{display:flex;align-items:center;gap:.6rem;padding:.7rem .9rem;border-radius:14px;background:linear-gradient(180deg,rgba(19,26,34,.9),rgba(14,20,28,.85));border:1px solid rgba(255,255,255,.06)}
 .input input{all:unset;flex:1;font-size:15px;color:var(--text)}
-.btn{padding:.55rem .8rem;border-radius:12px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,#1a2836,#16222f);box-shadow:var(--shadow);font-weight:700;cursor:pointer}
+.btn{padding:.7rem 1rem;border-radius:14px;border:1px solid rgba(255,255,255,.08);background:linear-gradient(180deg,#1a2836,#16222f);box-shadow:var(--shadow);font-weight:700;cursor:pointer}
 .wrap{padding:.35rem .9rem 1rem}
 .grid{display:grid;gap:.9rem;grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}
 .card{position:relative;padding:1rem .9rem .9rem;border-radius:16px;background:linear-gradient(180deg,rgba(19,26,34,.88),rgba(11,16,23,.86));border:1px solid rgba(255,255,255,.07);box-shadow:var(--shadow)}
@@ -190,6 +189,9 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:.55rem}
 .muted{color:#9fb0c4}
 .small{font-size:12px;opacity:.85}
+.actions{display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.4rem}
+.btn.sm{padding:.4rem .6rem;border-radius:10px;font-weight:600}
+hr{border:none;border-top:1px solid rgba(255,255,255,.08);margin:.6rem 0}
 </style>
 
 <div class=top>
@@ -209,7 +211,19 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 </div>
 
 <div class=wrap id=wrapGrid><div class=grid id=grid></div></div>
-<div class=list id=wrapPeers hidden></div>
+
+<!-- Peers -->
+<div class=list id=wrapPeers hidden>
+  <div class=row style="display:block">
+    <div class=muted style="margin-bottom:.35rem">Broadcast actions</div>
+    <div class=actions>
+      <button class=btn sm onclick="broadcastRoom()">Set room on all…</button>
+      <button class=btn sm onclick="broadcastClear()">Clear all</button>
+    </div>
+  </div>
+  <div id=peersWrap></div>
+</div>
+
 <div class=list id=wrapLogs hidden></div>
 
 <!-- Manage -->
@@ -220,9 +234,9 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
       <label class=input><input id=rawIn placeholder="RAW ID…"></label>
       <label class=input><input id=rawTag type=number placeholder="Tag #"></label>
     </div>
-    <div style="display:flex;gap:.6rem;margin-top:.5rem">
-      <button class=btn onclick="aliasSet()">Save Alias</button>
-      <button class=btn onclick="aliasDel()">Delete Alias</button>
+    <div class=actions>
+      <button class=btn sm onclick="aliasSet()">Save Alias</button>
+      <button class=btn sm onclick="aliasDel()">Delete Alias</button>
       <div class="small" id=aliasMsg></div>
     </div>
     <div class=muted style="margin:.7rem 0 .3rem">Seen RAW (tap to fill)</div>
@@ -232,8 +246,8 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
   <div class=row style="display:block">
     <div class=muted style="margin-bottom:.35rem">Rooms</div>
     <div id=roomsWrap style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:.5rem"></div>
-    <div style="display:flex;gap:.6rem;margin-top:.5rem">
-      <button class=btn onclick="roomsSave()">Save Rooms</button>
+    <div class=actions>
+      <button class=btn sm onclick="roomsSave()">Save Rooms</button>
       <div class="small" id=roomsMsg></div>
     </div>
   </div>
@@ -274,6 +288,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 let STATE={roomNames:[],tags:[],peers:[],logs:[],seenRaw:[]};
 let FILTER="";
 
+// Tabs
 document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
   document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
   t.classList.add("active");
@@ -287,10 +302,12 @@ document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
 });
 function wrap(id,show){ document.getElementById(id).hidden=!show; }
 
+// Search
 document.getElementById("btnSearch").onclick=()=>{FILTER=Q().toUpperCase(); renderGrid();};
 document.getElementById("q").oninput=()=>{FILTER=Q().toUpperCase(); renderGrid();};
 const Q=()=>document.getElementById("q").value.trim();
 
+// Grid
 const gridEl=document.getElementById("grid");
 function renderGrid(){
   gridEl.innerHTML="";
@@ -319,32 +336,40 @@ function renderGrid(){
   }
 }
 
+// Peers
+function peersRow(p){
+  const row = div("row");
+  row.innerHTML = `
+    <div style="flex:1;min-width:180px">
+      <div class="mono tag">${p.mac}</div>
+      <div class="small muted">room <b>${p.room||0}</b> • tail <b>${p.tail?1:0}</b> • next <span class="mono">${p.next||"-"}</span></div>
+      <div class="small muted">seen ${p.ago||"?"} ago</div>
+    </div>
+    <div class="actions">
+      <button class="btn sm" onclick="makeTail('${p.mac}')">Make Tail</button>
+      <button class="btn sm" onclick="tailOff('${p.mac}')">Tail Off</button>
+      <button class="btn sm" onclick="setRoomOne('${p.mac}')">Set Room…</button>
+      <button class="btn sm" onclick="setNextOne('${p.mac}')">Set Next…</button>
+      <button class="btn sm" onclick="clearOne('${p.mac}')">Clear</button>
+    </div>
+  `;
+  return row;
+}
 function renderPeers(){
-  const wrap=document.getElementById("wrapPeers"); wrap.innerHTML="";
+  const wrap=document.getElementById("peersWrap"); wrap.innerHTML="";
   if(!STATE.peers.length){ wrap.innerHTML='<div class=row>No peers yet.</div>'; return; }
   for(const p of STATE.peers){
-    const row=div("row");
-    row.appendChild(div("", `<div class="mono tag">${p.mac}</div><div>room <b>${p.room||"?"}</b></div><div class=muted>seen ${p.ago||"?"} ago</div>`));
-    const ctrls=div("", `<div style="margin-left:auto;display:flex;gap:.4rem;flex-wrap:wrap"></div>`);
-    const btnTail=button("Make tail", ()=>makeTail(p.mac));
-    const btnRoom=button("Set room", ()=>setRoom(p.mac));
-    const btnNext=button("Set next", ()=>setNext(p.mac));
-    const btnClr =button("Clear", ()=>clearNode(p.mac));
-    ctrls.firstChild?.appendChild(btnTail);
-    ctrls.firstChild?.appendChild(btnRoom);
-    ctrls.firstChild?.appendChild(btnNext);
-    ctrls.firstChild?.appendChild(btnClr);
-    row.appendChild(ctrls);
-    wrap.appendChild(row);
+    wrap.appendChild(peersRow(p));
   }
 }
-function button(label,fn){ const b=document.createElement("button"); b.className="btn small"; b.textContent=label; b.onclick=fn; return b; }
 
+// Logs
 function renderLogs(){
   const wrap=document.getElementById("wrapLogs"); wrap.innerHTML="";
   for(const L of STATE.logs){ wrap.appendChild(rowText(L,"mono")); }
 }
 
+// Manage
 function renderManage(){
   const RW=document.getElementById("roomsWrap"); RW.innerHTML="";
   const rooms=STATE.roomNames.length?STATE.roomNames:Array.from({length:5},(_,i)=>"Room "+(i+1));
@@ -395,15 +420,33 @@ document.getElementById("clearReg").onclick=async()=>{ if(!curTag) return; await
 document.getElementById("doMove").onclick=async()=>{ if(!curTag) return; const r=parseInt(dMove.value||"0"); if(r>0) await post("/moveTag",{tag:curTag,room:r}); drawer.classList.remove("open"); pollOnce(); };
 document.getElementById("forgetTag").onclick=async()=>{ if(!curTag) return; await post("/forgetTag",{tag:curTag}); drawer.classList.remove("open"); pollOnce(); };
 
-// ---- NEW: CFG helpers (UI → SMOKE over UART via /cfg) ----
-async function makeTail(mac){ await post("/cfg",{mac,tail:1}); }
-async function setRoom(mac){ const r=prompt("Room # for "+mac); if(!r) return; await post("/cfg",{mac,room:r}); }
-async function setNext(mac){ const n=prompt("Next MAC for "+mac+" (AA:BB:CC:DD:EE:FF)"); if(n===null) return; await post("/cfg",{mac,next:n}); }
-async function clearNode(mac){ if(!confirm("Clear settings on "+mac+"?")) return; await post("/cfg",{mac,clear:1}); }
+// ---- CFG helpers (UI-driven config) ----
+async function sendCfg(obj){ await post("/cfg", obj); }
+async function makeTail(mac){
+  await sendCfg({mac, tail:1});
+  // demote others individually (avoid demoting the new tail)
+  for(const p of STATE.peers){ if(p.mac!==mac) await sendCfg({mac:p.mac, tail:0}); }
+}
+async function tailOff(mac){ await sendCfg({mac, tail:0}); }
+async function setRoomOne(mac){
+  const v=prompt("Room number for "+mac, "1"); if(!v) return;
+  await sendCfg({mac, room:parseInt(v||"0")});
+}
+async function setNextOne(mac){
+  const v=prompt("Next MAC for "+mac+" (AA:BB:CC:DD:EE:FF)", ""); if(v===null) return;
+  await sendCfg({mac, next:v.trim()});
+}
+async function clearOne(mac){ await sendCfg({mac, clear:1}); }
+
+async function broadcastRoom(){
+  const v=prompt("Set room on ALL devices to:", "1"); if(!v) return;
+  await sendCfg({room:parseInt(v||"0")});
+}
+async function broadcastClear(){ await sendCfg({clear:1}); }
 
 // Fetch helpers
 async function post(path, obj){
-  const b=new URLSearchParams(); for(const k in obj) b.append(k,obj[k]);
+  const b=new URLSearchParams(); for(const k in obj) if(obj[k]!==undefined && obj[k]!==null) b.append(k,obj[k]);
   await fetch(path,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:b.toString()});
 }
 function div(c,html){ const d=document.createElement("div"); if(c) d.className=c; if(html!==undefined) d.innerHTML=html; return d; }
@@ -437,6 +480,9 @@ static String formValue(const String& body, const char* key){
   }
   return o;
 }
+static void sendStatus(){
+  pushLog(String("[AP] ")+AP_SSID+"  IP: "+WiFi.softAPIP().toString());
+}
 
 // -------- HTTP handlers --------
 void handleStateJson(){
@@ -456,7 +502,7 @@ void handleStateJson(){
   }
   s += "],\"peers\":[";
   for(int i=0;i<peerCount;i++){ if(i) s+=','; uint32_t ago=(millis()-peers[i].lastMs)/1000;
-    s += "{\"mac\":\""+jsonEscape(peers[i].mac)+"\",\"room\":"+String(peers[i].room)+",\"ago\":\""+String(ago)+"s\"}";
+    s += "{\"mac\":\""+jsonEscape(peers[i].mac)+"\",\"room\":"+String(peers[i].room)+",\"tail\":"+String(peers[i].tail)+",\"next\":\""+jsonEscape(peers[i].next)+"\",\"ago\":\""+String(ago)+"s\"}";
   }
   s += "],\"logs\":[";
   bool f2=true; for(int i=0;i<LOG_RING;i++){ int idx=(logPtr+i)%LOG_RING; if(logBuf[idx].length()){
@@ -517,48 +563,56 @@ void handleAliasDel(){
   String raw=formValue(body,"raw"); if(raw.length()) aliasDel(raw);
   server.send(200,"text/plain","OK");
 }
-
-// ---- NEW: /cfg -> emit a CFG line on UART toward SMOKE ----
+// NEW: /cfg — build and emit a CFG line to SMOKE tail over UART2
 void handleCfg(){
   String body = server.hasArg("plain")? server.arg("plain") : "";
-  String mac  = formValue(body,"mac");
-  String room = formValue(body,"room");
-  String tail = formValue(body,"tail");
-  String next = formValue(body,"next");
-  String clear= formValue(body,"clear");
+  String mac   = formValue(body,"mac");   mac.trim();
+  String room  = formValue(body,"room");  room.trim();
+  String tail  = formValue(body,"tail");  tail.trim();
+  String next  = formValue(body,"next");  next.trim();
+  String clear = formValue(body,"clear"); clear.trim();
+  String key   = formValue(body,"key");   key.trim();
 
-  String msg="CFG:";
+  String msg = "CFG:";
   bool first=true;
-  auto addKV=[&](const String& k,const String& v){
-    if(!v.length()) return;
+  auto add=[&](const String& k, const String& v, bool forceOne=false){
+    if(!v.length() && !forceOne) return;
     if(!first) msg+=','; first=false;
-    msg+=k; msg+='='; msg+=v;
+    msg += k;
+    if(forceOne){ msg += "=1"; }
+    else { msg += "="; msg += v; }
   };
-  addKV("mac",mac);
-  addKV("room",room);
-  addKV("tail",tail);
-  addKV("next",next);
-  if(clear.length()){ if(!first) msg+=','; msg+="clear=1"; first=false; }
+  if(mac.length())   add("mac",   mac);
+  if(room.length())  add("room",  room);
+  if(tail.length())  add("tail",  tail);
+  if(next.length())  add("next",  next);
+  if(clear.length()) add("clear", "", true);
+  if(key.length())   add("key",   key);
 
   Serial2.println(msg);
-  pushLog("[UI→SMOKE] "+msg);
+  pushLog(String("[CFG→SMOKE] ")+msg);
   server.send(200,"text/plain","OK");
 }
 
-// -------- UART2 parsing (from SMOKE tail) --------
+// -------- UART2 parsing --------
 volatile bool u2Flag=false; String u2Q;
 
 static void parseLine(String s){
   s.trim(); if(!s.length()) return;
 
   if(s.startsWith("HELLO")){
-    String mac, roomS; int mi=s.indexOf("mac="), ri=s.indexOf("room=");
-    if(mi>=0){ mac=s.substring(mi+4); int c=mac.indexOf(','); if(c>0) mac=mac.substring(0,c); }
+    // Example: HELLO,mac=AA:BB:...,room=N,tail=0/1,next=xx:.. or next=00:...
+    String mac, roomS, tailS, nextS;
+    int mi=s.indexOf("mac="), ri=s.indexOf("room="), ti=s.indexOf("tail="), ni=s.indexOf("next=");
+    if(mi>=0){ mac=s.substring(mi+4); int c=mac.indexOf(','); if(c>0) mac=mac.substring(0,c); mac.trim(); }
     if(ri>=0){ roomS=s.substring(ri+5); int c=roomS.indexOf(','); if(c>0) roomS=roomS.substring(0,c); }
-    int room=roomS.toInt();
+    if(ti>=0){ tailS=s.substring(ti+5); int c=tailS.indexOf(','); if(c>0) tailS=tailS.substring(0,c); }
+    if(ni>=0){ nextS=s.substring(ni+5); int c=nextS.indexOf(','); if(c>0) nextS=nextS.substring(0,c); nextS.trim(); }
+
+    int room=roomS.toInt(); int tail=(tailS.toInt()!=0);
     int idx=-1; for(int i=0;i<peerCount;i++) if(peers[i].mac==mac){ idx=i; break; }
-    if(idx<0 && peerCount<MAX_PEERS){ idx=peerCount++; peers[idx].mac=mac; peers[idx].room=0; peers[idx].lastMs=0; }
-    if(idx>=0){ peers[idx].lastMs=millis(); if(room>0) peers[idx].room=room; }
+    if(idx<0 && peerCount<MAX_PEERS){ idx=peerCount++; peers[idx].mac=mac; peers[idx].room=0; peers[idx].tail=0; peers[idx].next=""; peers[idx].lastMs=0; }
+    if(idx>=0){ peers[idx].lastMs=millis(); if(room>=0) peers[idx].room=room; peers[idx].tail=(uint8_t)tail; peers[idx].next=nextS; }
     pushLog(s); return;
   }
 
@@ -571,6 +625,7 @@ static void parseLine(String s){
     pushLog(s); return;
   }
 
+  // Accept any prefix ending with ':'
   int colon=s.indexOf(':'); if(colon>=0) s=s.substring(colon+1);
 
   static bool seen[MAX_TAG_ID+1]; memset(seen,0,sizeof(seen));
@@ -631,7 +686,7 @@ void setup(){
   server.on("/roomsSave",   HTTP_POST, handleRoomsSave);
   server.on("/aliasSet",    HTTP_POST, handleAliasSet);
   server.on("/aliasDel",    HTTP_POST, handleAliasDel);
-  server.on("/cfg",         HTTP_POST, handleCfg);            // <— NEW
+  server.on("/cfg",         HTTP_POST, handleCfg);   // <— NEW
   server.onNotFound([](){ server.send(404,"text/plain","404"); });
   server.begin();
 }
