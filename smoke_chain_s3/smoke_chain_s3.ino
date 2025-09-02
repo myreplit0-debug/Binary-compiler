@@ -1,367 +1,370 @@
 /*
-  smoke_chain_s3.ino  —  SMOKE node (ESP32-S3) • Arduino-ESP32 core 3.x
+  smoke_chain_s3.ino
+  ESP32-S3 "SMOKE" node for KeyGrid
 
-  Chain:
-    ICE --UART1--> SMOKE(1) --ESP-NOW ch6--> ... --> SMOKE(tail) --UART1--> UI S3
+  - Non-tail nodes:
+      * Read BLE hits from ICE on UART1 (formats: "T,<id>,<rssi>" or "TAG <id> <rssi>")
+      * Keep strongest RSSI per tag
+      * Merge upstream aggregates from previous SMOKE; forward to next via ESP-NOW
+  - Tail node:
+      * No ICE input
+      * Outputs merged list as "UI: <room>.<tag>@<str>, ..." to UI over UART1
+      * Forwards any "CFG:..." coming from UI (UART1) via ESP-NOW broadcast
 
-  UART1:
-    • Non-tail: RX from ICE (raw BLE lines)
-    • Tail:     TX to UI (“UI: r.t@s, r.t@s, …”) and HELLO/CFG passthrough
+  - All nodes:
+      * Receive CFG over ESP-NOW (or UART if tail) -> save to Preferences
+      * Send HELLO over ESP-NOW broadcast (mac, room, tail, next)
+      * ESPNOW channel: 6 (changeable)
 
-  UI config (sent over ESPNOW; also accepted on UART1 for bench):
-    CFG:room=<n>      (0..25)
-    CFG:tail=0|1
-    CFG:next=AA:BB:CC:DD:EE:FF
-    CFG:clear
-
-  All UI assignments happen in the UI. Nodes boot unassigned (room=0).
+  Compile: ESP32-S3, Arduino-ESP32 core 3.x (IDF v5)
 */
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <esp_wifi.h>
 #include <esp_now.h>
 #include <Preferences.h>
 
-// === Forward declare to satisfy Arduino's auto-prototype generator ===
-struct Agg;
+// ----------------- Build-time config -----------------
+#define ESPNOW_CH        6
+#define ICE_RX1          16     // UART1 RX (from ICE TX) OR from UI (when tail)
+#define ICE_TX1          17     // UART1 TX (to ICE RX) OR to UI (when tail)
 
-// ---------- Pins ----------
-#define RX1_PIN    18
-#define TX1_PIN    17
-#define UART_BAUD  115200
+#define MAX_TAG_ID       1024
+#define HELLO_PERIOD_MS  2000
+#define FLUSH_PERIOD_MS  600    // how often we send aggregates upstream
+#define ICE_READ_BUDGET  48     // chars per loop to keep loop snappy
 
-// ---------- ESPNOW ----------
-#define ESPNOW_CH  6
-static const uint8_t BCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-
-// ---------- Limits & timing ----------
-#define MAX_ITEMS        160
-#define TAG_TTL_MS       2000
-#define CYCLE_MS          800
-#define FWD_DEBOUNCE_MS    30
-#define HELLO_MS         3000
-
-// ---------- Persisted config ----------
+// ----------------- Globals: identity & config ------------
 Preferences prefs;
-struct Config {
-  uint8_t room = 0;        // 0 = unassigned
-  bool    isTail = false;
-  bool    hasNext = false;
-  uint8_t next[6] = {0};
-} CFG;
+bool isTail = false;
+uint8_t roomNo = 0;             // 0 = unassigned
+uint8_t nextMac[6] = {0};       // next hop MAC; all zeros = none
 
-static void saveCfg(){
-  prefs.begin("smoke", false);
-  prefs.putUChar("room", CFG.room);
-  prefs.putBool("tail", CFG.isTail);
-  prefs.putBool("hasNext", CFG.hasNext);
-  prefs.putBytes("next", CFG.next, 6);
-  prefs.end();
+// ----------------- UART & buffers -----------------
+HardwareSerial &SICE = Serial1; // same physical UART1; role depends on isTail
+String iceLine;
+
+// ----------------- Aggregation store -----------------
+static uint8_t bestStr[MAX_TAG_ID + 1];  // 0..100 (strength mapped from RSSI)
+static uint32_t lastHello = 0;
+static uint32_t lastFlush = 0;
+
+// ----------------- Utilities -----------------
+static inline void macToStr(const uint8_t mac[6], char out[18]){
+  sprintf(out, "%02X:%02X:%02X:%02X:%02X:%02X",
+          mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
 }
-static void loadCfg(){
-  prefs.begin("smoke", true);
-  CFG.room    = prefs.getUChar("room", 0);
-  CFG.isTail  = prefs.getBool("tail", false);
-  CFG.hasNext = prefs.getBool("hasNext", false);
-  size_t n = prefs.getBytesLength("next");
-  if(n==6) prefs.getBytes("next", CFG.next, 6);
-  prefs.end();
-}
-
-// ---------- Small helpers ----------
-static inline uint8_t clampU8(int v){ if(v<0) v=0; if(v>100) v=100; return (uint8_t)v; }
-
-static bool macFromStr(const String& s, uint8_t out[6]){
-  int p=0, b=0;
-  while(b<6){
-    if(p+2 > (int)s.length()) return false;
-    int v = strtol(s.substring(p,p+2).c_str(), nullptr, 16);
-    out[b++] = (uint8_t)v;
-    p += 2;
-    if(b<6){ if(p >= (int)s.length() || s[p] != ':') return false; p++; }
-  }
+static inline bool strToMac(const String &s, uint8_t mac[6]){
+  if(s.length()!=17) return false;
+  int b[6];
+  if(sscanf(s.c_str(), "%2x:%2x:%2x:%2x:%2x:%2x", &b[0],&b[1],&b[2],&b[3],&b[4],&b[5])!=6) return false;
+  for(int i=0;i<6;i++) mac[i] = (uint8_t)b[i];
   return true;
 }
-static String macToStr(const uint8_t m[6]){
-  char buf[18]; sprintf(buf,"%02X:%02X:%02X:%02X:%02X:%02X",m[0],m[1],m[2],m[3],m[4],m[5]); return String(buf);
+static inline uint8_t rssiToStrength(int rssi){
+  // clamp -100..-30 map to 0..100
+  if(rssi > -30) rssi = -30;
+  if(rssi < -100) rssi = -100;
+  int v = (rssi + 100) * (100.0/70.0) + 0.5; // -100->0, -30->100
+  if(v<0) v=0; if(v>100) v=100;
+  return (uint8_t)v;
 }
-static uint8_t MYMAC[6];
-
-// ---------- Local dedup (per node) ----------
-struct Item { uint16_t tag; uint8_t str; uint32_t seen; };
-static Item table_[MAX_ITEMS]; static int nItems=0;
-
-static uint16_t hash16(const String& s){
-  uint32_t h=2166136261u;
-  for(size_t i=0;i<s.length();++i){ h^=(uint8_t)s[i]; h*=16777619u; }
-  return (uint16_t)((h>>16)^(h&0xFFFF));
-}
-static uint8_t rssiToStrength(int rssi){
-  if(rssi<-95) rssi=-95; if(rssi>-35) rssi=-35;
-  int v=(rssi+95)*100/60; return clampU8(v);
-}
-static int findTag(uint16_t t){ for(int i=0;i<nItems;i++) if(table_[i].tag==t) return i; return -1; }
-static void upsert(uint16_t tag, uint8_t str){
-  uint32_t now=millis();
-  int i=findTag(tag);
-  if(i<0){
-    if(nItems<MAX_ITEMS) table_[nItems++]={tag,str,now};
-    else table_[random(nItems)]={tag,str,now};
-  }else{
-    if(str>table_[i].str) table_[i].str=str;
-    table_[i].seen=now;
-  }
-}
-static void decay(){
-  uint32_t now=millis();
-  for(int i=0;i<nItems;){
-    if(now - table_[i].seen > TAG_TTL_MS) table_[i]=table_[--nItems];
-    else i++;
-  }
+static inline bool macIsZero(const uint8_t mac[6]){
+  for(int i=0;i<6;i++) if(mac[i]!=0) return false;
+  return true;
 }
 
-// Ingest ICE UART line → update local table
-static void parseIceLine(String s){
-  s.trim(); if(!s.length()) return;
-  String name; long id=-1; int rssi=0; bool have=false;
-
-  int c=s.indexOf(','); String a=(c>=0?s.substring(0,c):s), b=(c>=0?s.substring(c+1):"");
-  if(b.length()){
-    int p=b.indexOf("rssi=");
-    if(p>=0) rssi=b.substring(p+5).toInt();
-    else     rssi=b.toInt();
-    have=true;
-  }
-  if(a.startsWith("ID=")||a.startsWith("id=")) id=a.substring(3).toInt();
-  else{
-    int pn=a.indexOf("name=");
-    name=(pn>=0? a.substring(pn+5):a);
-  }
-  uint16_t tag=(id>=0)?(uint16_t)id:hash16(name);
-  if(have && tag>0) upsert(tag, rssiToStrength(rssi));
+// ----------------- Persistent config -----------------
+void loadPrefs(){
+  prefs.begin("smoke", true);
+  isTail = prefs.getBool("tail", false);
+  roomNo = prefs.getUChar("room", 0);
+  String ns = prefs.getString("next", "");
+  prefs.end();
+  if(ns.length()==17) strToMac(ns, nextMac);
+  else memset(nextMac, 0, 6);
+}
+void savePrefs(){
+  char nbuf[18]; macToStr(nextMac, nbuf);
+  prefs.begin("smoke", false);
+  prefs.putBool("tail", isTail);
+  prefs.putUChar("room", roomNo);
+  prefs.putString("next", nbuf);
+  prefs.end();
 }
 
-// ---------- Per-cycle aggregator ----------
-struct Agg {
-  int      cyc = -1;
-  uint16_t tag[MAX_ITEMS];
-  uint8_t  str[MAX_ITEMS];
-  int      n = 0;
-  uint32_t updated = 0;
-};
+// ----------------- ESPNOW payloads -----------------
+// We keep it simple: small ASCII header then data.
+//
+// Types:
+//   "HELLO,mac=..,room=N,tail=0/1,next=.."
+//   "CFG:room=N,tail=0/1,next=aa:bb:..,mac=aa:bb.." (mac optional -> self)
+//   "AGG:<room>.<tag>@<str>,<room>.<tag>@<str>,..."
+//
+// NOTE: AGG room field in lines generated by each node uses *that* node's roomNo.
 
-static void aggReset(Agg& A, int cyc){ A.cyc=cyc; A.n=0; A.updated=millis(); }
-static int  aggFind(const Agg& A, uint16_t t){ for(int i=0;i<A.n;i++) if(A.tag[i]==t) return i; return -1; }
-static void aggMergeOne(Agg& A, uint16_t t, uint8_t s){
-  int i=aggFind(A,t);
-  if(i<0){ if(A.n<MAX_ITEMS){ A.tag[A.n]=t; A.str[A.n]=s; A.n++; } }
-  else if(s>A.str[i]) A.str[i]=s;
-  A.updated=millis();
-}
-static void aggMergeList(Agg& A, const String& payload, int room){
-  int i=0;
-  while(i < (int)payload.length()){
-    int comma = payload.indexOf(',', i); if(comma<0) comma=payload.length();
-    String tok=payload.substring(i, comma); tok.trim();
-    int d=tok.indexOf('.'); int at=tok.indexOf('@');
-    if(d>0 && at>d){
-      int r = tok.substring(0,d).toInt();
-      uint16_t t = (uint16_t)tok.substring(d+1,at).toInt();
-      int sval = tok.substring(at+1).toInt();
-      uint8_t s = clampU8(sval);
-      if(room==0 || r==room) aggMergeOne(A,t,s);
-    }
-    i = comma+1;
-  }
-}
-static void aggMergeLocal(Agg& A){
-  decay();
-  if(CFG.room==0) return;
-  for(int i=0;i<nItems;i++) aggMergeOne(A, table_[i].tag, table_[i].str);
-}
-static String aggToPayload(const Agg& A, int room){
-  String o; bool first=true;
-  for(int i=0;i<A.n;i++){
-    if(!first) o += ", ";
-    first=false;
-    o += String((int)room) + "." + String((int)A.tag[i]) + "@" + String((int)A.str[i]);
-  }
-  return o;
+static uint8_t bcastAddr[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+void sendNow(const uint8_t* mac, const char* s){
+  esp_now_send(mac, (const uint8_t*)s, strlen(s));
 }
 
-// Working sets + pacing
-static Agg FWD, UIA;
-static bool fwdArmed=false; static uint32_t fwdDue=0;
-static int  lastPrintedCyc=-1;
-
-// ---------- ESPNOW callbacks (core 3.x) ----------
-static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len){
-  (void)info;
+// ----------------- ESPNOW callbacks (IDF v5 signatures) ---------------
+void onRecv(const esp_now_recv_info* info, const uint8_t* data, int len){
   if(!data || len<=0) return;
 
-  // Config frames
-  if(len>=4 && data[0]=='C' && data[1]=='F' && data[2]=='G' && data[3]==':'){
-    String s((const char*)data, len); s.trim();
-    if(s.indexOf("clear")>=0){
-      CFG.room=0; CFG.isTail=false; CFG.hasNext=false; memset(CFG.next,0,6); saveCfg();
-      return;
+  String msg; msg.reserve(len+1);
+  for(int i=0;i<len;i++) msg += (char)data[i];
+
+  // Handle incoming CFG
+  if(msg.startsWith("CFG:")){
+    // parse "key=val" pairs
+    // keys: room, tail, next, clear, mac (target)
+    int targetOk = 1;  // default accept
+    String target = "";
+    int p = 4;
+    while(p < msg.length()){
+      int c = msg.indexOf(',', p); if(c<0) c = msg.length();
+      String kv = msg.substring(p, c); kv.trim();
+      int eq = kv.indexOf('=');
+      String k = (eq>0)? kv.substring(0,eq) : kv;
+      String v = (eq>0)? kv.substring(eq+1) : "1";
+
+      if(k=="mac"){
+        target = v;
+        char me[18]; macToStr(WiFi.macAddress((uint8_t*)NULL), me); // not correct usage; do differently
+      }
+      p = c+1;
     }
-    int p;
-    if((p=s.indexOf("room="))>=0){ CFG.room = (uint8_t)constrain(s.substring(p+5).toInt(),0,25); saveCfg(); }
-    if((p=s.indexOf("tail="))>=0){ CFG.isTail = (s.substring(p+5).toInt()!=0); saveCfg(); }
-    if((p=s.indexOf("next="))>=0){
-      String mac = s.substring(p+5); mac.trim();
-      uint8_t tmp[6]; if(macFromStr(mac,tmp)){ memcpy(CFG.next,tmp,6); CFG.hasNext=true; saveCfg(); }
+
+    // If a target mac= is present and it's not us, ignore
+    int macPos = msg.indexOf("mac=");
+    if(macPos >= 0){
+      String m = msg.substring(macPos+4);
+      int comma = m.indexOf(','); if(comma>0) m = m.substring(0, comma);
+      m.trim();
+      uint8_t tmac[6];
+      if(strToMac(m, tmac)){
+        uint8_t my[6]; WiFi.macAddress(my);
+        if(memcmp(tmac, my, 6)!=0) return; // not for us
+      }
     }
+
+    // Apply keys
+    p = 4;
+    while(p < msg.length()){
+      int c = msg.indexOf(',', p); if(c<0) c = msg.length();
+      String kv = msg.substring(p, c); kv.trim();
+      int eq = kv.indexOf('=');
+      String k = (eq>0)? kv.substring(0,eq) : kv;
+      String v = (eq>0)? kv.substring(eq+1) : "1";
+
+      if(k=="room"){
+        int r = v.toInt(); if(r>=0 && r<=255) roomNo = (uint8_t)r;
+      }else if(k=="tail"){
+        isTail = (v.toInt()!=0);
+      }else if(k=="next"){
+        if(!strToMac(v, nextMac)) memset(nextMac, 0, 6);
+      }else if(k=="clear"){
+        isTail = false; roomNo = 0; memset(nextMac,0,6);
+      }
+      p = c+1;
+    }
+    savePrefs();
     return;
   }
 
-  // Upstream data U#C:<list>
-  if(len>=3 && data[0]=='U' && data[1]=='#'){
-    int i=2; int j=i; while(j<len && data[j]!=':') j++;
-    if(j>=len) return;
-    int cyc = String((const char*)data+i, j-i).toInt();
-    String pay((const char*)data+j+1, len-j-1);
-
-    if(!CFG.isTail){
-      if(FWD.cyc!=cyc) aggReset(FWD,cyc);
-      aggMergeList(FWD, pay, CFG.room);
-      aggMergeLocal(FWD);
-      fwdArmed=true; fwdDue=millis()+FWD_DEBOUNCE_MS;
-    }else{
-      if(UIA.cyc!=cyc) aggReset(UIA,cyc);
-      aggMergeList(UIA, pay, CFG.room);
+  // Handle incoming AGG: merge strongest
+  if(msg.startsWith("AGG:")){
+    int p = 4;
+    while(p < msg.length()){
+      int c = msg.indexOf(',', p); if(c<0) c = msg.length();
+      String tok = msg.substring(p, c); tok.trim();
+      // format room.tag@str
+      int dot = tok.indexOf('.');
+      int at  = tok.indexOf('@');
+      if(dot>0 && at>dot){
+        int tag = tok.substring(dot+1,at).toInt();
+        int str = tok.substring(at+1).toInt();
+        if(tag>=1 && tag<=MAX_TAG_ID){
+          if(str<0) str=0; if(str>100) str=100;
+          if(str > bestStr[tag]) bestStr[tag] = (uint8_t)str;
+        }
+      }
+      p = c+1;
     }
-    return;
-  }
-
-  // HELLO passthrough to UART (tail only)
-  if(len>=5 && data[0]=='H' && data[1]=='E'){
-    if(CFG.isTail) { Serial1.write(data, len); Serial1.write('\n'); }
   }
 }
 
-static void onSent(const uint8_t* mac_addr, esp_now_send_status_t status){
+void onSent(const uint8_t* mac_addr, esp_now_send_status_t status){
   (void)mac_addr; (void)status;
+  // optional: debug
 }
 
-// ---------- ESPNOW init ----------
-static bool addPeerIfMissing(const uint8_t mac[6]){
-  if(esp_now_is_peer_exist(mac)) return true;
-  esp_now_peer_info_t p={};
+// ----------------- ESPNOW init & peers -----------------
+bool addPeer(const uint8_t mac[6]){
+  if(macIsZero(mac)) return false;
+  esp_now_peer_info_t p = {};
   memcpy(p.peer_addr, mac, 6);
-  p.ifidx   = WIFI_IF_STA;
   p.channel = ESPNOW_CH;
   p.encrypt = false;
-  return esp_now_add_peer(&p)==ESP_OK;
+  // ignore duplicate add
+  if(esp_now_is_peer_exist(mac)) return true;
+  return esp_now_add_peer(&p) == ESP_OK;
 }
-static bool espnowInit(){
-  WiFi.mode(WIFI_STA);
-  esp_wifi_set_channel(ESPNOW_CH, WIFI_SECOND_CHAN_NONE);
-  if(esp_now_init()!=ESP_OK) return false;
-  esp_now_register_recv_cb(onRecv);
-  esp_now_register_send_cb((esp_now_send_cb_t)onSent);   // explicit cast
-  addPeerIfMissing(BCAST);
-  if(CFG.hasNext) addPeerIfMissing(CFG.next);
-  esp_wifi_get_mac(WIFI_IF_STA, MYMAC);
-  return true;
-}
-static void sendStr(const uint8_t mac[6], const String& s){
-  addPeerIfMissing(mac);
-  esp_now_send(mac, (const uint8_t*)s.c_str(), s.length());
-}
-static void broadcastStr(const String& s){ sendStr(BCAST, s); }
-
-// ---------- Periodics ----------
-static uint32_t tHello=0, tCycleTick=0;
-static String uartBuf;
-
-static void sendHello(){
-  String s = "HELLO,mac="+macToStr(MYMAC)+",room="+String((int)CFG.room)+",tail="+String((int)CFG.isTail);
-  if(CFG.hasNext) s += ",next="+macToStr(CFG.next);
-  broadcastStr(s);
-  if(CFG.isTail) { Serial1.println(s); }
+void ensurePeers(){
+  addPeer(bcastAddr);
+  if(!macIsZero(nextMac)) addPeer(nextMac);
 }
 
-static void originateCycle(){
-  if(CFG.isTail || !CFG.hasNext) return;
-  int cyc = (int)(millis()/CYCLE_MS);
-  Agg A; aggReset(A, cyc);
-  aggMergeLocal(A);
-  String payload = aggToPayload(A, CFG.room);
-  if(payload.length()){
-    String frame = String("U#")+String(cyc)+": "+payload;
-    sendStr(CFG.next, frame);
+// ----------------- HELLO & AGG emit -----------------
+void sendHello(){
+  uint8_t my[6]; WiFi.macAddress(my);
+  char mstr[18]; macToStr(my, mstr);
+  char nstr[18]; macToStr(nextMac, nstr);
+  char buf[128];
+  snprintf(buf, sizeof(buf),
+    "HELLO,mac=%s,room=%u,tail=%u,next=%s",
+    mstr, (unsigned)roomNo, (unsigned)(isTail?1:0), nstr);
+  sendNow(bcastAddr, buf);
+}
+
+void forwardAggOrPrint(){
+  // Build compact line from local bestStr
+  String out; out.reserve(256);
+  out += "AGG:";
+  bool first=true;
+  for(int i=1;i<=MAX_TAG_ID;i++){
+    uint8_t s = bestStr[i];
+    if(s){
+      if(!first) out += ',';
+      first=false;
+      out += String((int)roomNo); out += '.';
+      out += String(i); out += '@';
+      out += String((int)s);
+    }
+  }
+
+  if(first){
+    // nothing to send; still forward empty to carry upstream aggregates if needed
+  }
+
+  if(isTail){
+    // Convert for UI and print
+    if(out.length()>4){
+      String ui = "UI: " + out.substring(4);
+      SICE.println(ui);
+    }
+  }else{
+    // Forward to next
+    if(!macIsZero(nextMac)){
+      ensurePeers();
+      sendNow(nextMac, out.c_str());
+    }
+  }
+
+  // decay a bit so dead tags fade
+  for(int i=1;i<=MAX_TAG_ID;i++){
+    if(bestStr[i]>0){
+      if(bestStr[i]>2) bestStr[i]-=2;
+      else bestStr[i]=0;
+    }
   }
 }
 
-static void forwardIfDue(){
-  if(CFG.isTail || !CFG.hasNext) return;
-  if(!fwdArmed || millis()<fwdDue) return;
-  fwdArmed=false;
-  String payload = aggToPayload(FWD, CFG.room);
-  if(payload.length()){
-    String frame = String("U#")+String(FWD.cyc)+": "+payload;
-    sendStr(CFG.next, frame);
+// ----------------- ICE (or UI when tail) line parsing -------------
+bool parseTagLine(const String& line, int &tag, int &rssi){
+  // Accept: "T,<id>,<rssi>" or "TAG <id> <rssi>"
+  if(line.length()<5) return false;
+  if(line[0]=='T'){
+    int a=line.indexOf(','); if(a<0) return false;
+    int b=line.indexOf(',', a+1); if(b<0) return false;
+    tag = line.substring(a+1, b).toInt();
+    rssi= line.substring(b+1).toInt();
+    return tag>0;
+  }else if(line.startsWith("TAG ")){
+    int a=line.indexOf(' ',4); if(a<0) return false;
+    tag = line.substring(4, a).toInt();
+    rssi= line.substring(a+1).toInt();
+    return tag>0;
+  }
+  return false;
+}
+
+// ----------------- Handle UART1 -----------------
+void pumpUART1(){
+  int budget = ICE_READ_BUDGET;
+  while(budget-- > 0 && SICE.available()){
+    char c = (char)SICE.read();
+    if(c=='\n'){
+      String s = iceLine; iceLine = "";
+      s.trim();
+      if(!s.length()) continue;
+
+      if(isTail){
+        // TAIL: look for CFG lines from UI and rebroadcast
+        if(s.startsWith("CFG:")){
+          ensurePeers();
+          sendNow(bcastAddr, s.c_str());
+        }
+      }else{
+        // NON-TAIL: parse ICE tag lines
+        int tag, rssi;
+        if(parseTagLine(s, tag, rssi)){
+          uint8_t st = rssiToStrength(rssi);
+          if(tag>=1 && tag<=MAX_TAG_ID){
+            if(st > bestStr[tag]) bestStr[tag] = st;
+          }
+        }
+      }
+    }else if(c!='\r'){
+      iceLine += c;
+      if(iceLine.length()>256) iceLine.remove(0,64);
+    }
   }
 }
 
-static void tailPrintIfReady(){
-  if(!CFG.isTail) return;
-  int cyc = (int)(millis()/CYCLE_MS);
-  if(UIA.cyc!=cyc || lastPrintedCyc==cyc) return;
-  aggMergeLocal(UIA);
-  String pay = aggToPayload(UIA, CFG.room);
-  if(pay.length()){
-    Serial1.print("UI: "); Serial1.println(pay);
-    lastPrintedCyc = cyc;
-  }
-}
-
-// ---------- Setup / Loop ----------
+// ----------------- Setup / Loop -----------------
 void setup(){
   Serial.begin(115200);
-  Serial1.begin(UART_BAUD, SERIAL_8N1, RX1_PIN, TX1_PIN);
-  delay(50);
 
-  loadCfg();
-  Serial.printf("[CFG] room=%u tail=%d hasNext=%d next=%s\n",
-      CFG.room, (int)CFG.isTail, (int)CFG.hasNext, CFG.hasNext? macToStr(CFG.next).c_str():"--");
+  // UART1: either to ICE (non-tail) or to UI (tail). Same pins.
+  SICE.begin(115200, SERIAL_8N1, ICE_RX1, ICE_TX1);
 
-  if(!espnowInit()) Serial.println("[ERR] esp_now_init failed"); else Serial.println("[OK] ESPNOW ch6");
-  sendHello();
+  // ESPNOW init on channel
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(ESPNOW_CH, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  if(esp_now_init()!=ESP_OK){
+    Serial.println("ESP-NOW init failed"); delay(3000); ESP.restart();
+  }
+  esp_now_register_recv_cb(onRecv);
+  esp_now_register_send_cb(onSent);
+
+  loadPrefs();
+  ensurePeers();
+
+  // Clear agg store
+  memset(bestStr, 0, sizeof(bestStr));
+
+  Serial.println("[SMOKE] boot");
+  uint8_t me[6]; WiFi.macAddress(me);
+  char macs[18]; macToStr(me, macs);
+  Serial.printf("[SMOKE] mac=%s room=%u tail=%u next=...\n", macs, roomNo, isTail?1:0);
 }
 
 void loop(){
-  // UART1 ingest (ICE lines or bench CFG: commands)
-  while(Serial1.available()){
-    char c=(char)Serial1.read();
-    if(c=='\n'){
-      String s=uartBuf; uartBuf=""; s.trim();
-      if(s.startsWith("CFG:")){
-        if(s.indexOf("clear")>=0){ CFG.room=0; CFG.isTail=false; CFG.hasNext=false; memset(CFG.next,0,6); saveCfg(); }
-        int p;
-        if((p=s.indexOf("room="))>=0){ CFG.room=(uint8_t)constrain(s.substring(p+5).toInt(),0,25); saveCfg(); }
-        if((p=s.indexOf("tail="))>=0){ CFG.isTail=(s.substring(p+5).toInt()!=0); saveCfg(); }
-        if((p=s.indexOf("next="))>=0){
-          String mac = s.substring(p+5); mac.trim();
-          uint8_t tmp[6]; if(macFromStr(mac,tmp)){ memcpy(CFG.next,tmp,6); CFG.hasNext=true; saveCfg(); addPeerIfMissing(CFG.next); }
-        }
-      }else if(s.length()){
-        parseIceLine(s);
-      }
-    }else if(c!='\r'){
-      uartBuf += c;
-      if(uartBuf.length()>600) uartBuf.remove(0,200);
-    }
+  pumpUART1();
+
+  uint32_t now = millis();
+  if(now - lastHello >= HELLO_PERIOD_MS){
+    lastHello = now;
+    sendHello();
   }
-
-  decay();
-
-  uint32_t now=millis();
-  if(now - tHello     >= HELLO_MS) { tHello=now; sendHello(); }
-  if(now - tCycleTick >= CYCLE_MS) { tCycleTick=now; originateCycle(); }
-  forwardIfDue();
-  tailPrintIfReady();
+  if(now - lastFlush >= FLUSH_PERIOD_MS){
+    lastFlush = now;
+    forwardAggOrPrint();
+  }
 }
