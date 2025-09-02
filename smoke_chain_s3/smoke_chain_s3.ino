@@ -60,6 +60,7 @@ void loadPrefs() {
   if (ns.length()==17) strToMac(ns, nextMac);
   else memset(nextMac, 0, 6);
 }
+
 void savePrefs() {
   char nbuf[18]; macToStr(nextMac, nbuf);
   prefs.begin("smoke", false);
@@ -229,7 +230,7 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
   }
 }
 
-// *** send callback expected by your core: 2 args, first is wifi_tx_info_t* ***
+// *** send callback expected by your core: 2 args ***
 static void onSent(const wifi_tx_info_t* tx_info, esp_now_send_status_t status) {
   (void)tx_info; (void)status;
 }
