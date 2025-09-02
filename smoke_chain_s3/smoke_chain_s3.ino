@@ -22,16 +22,14 @@
 #include <esp_wifi.h>
 #include <Preferences.h>
 
-// ----------------- Config -----------------
 #define ESPNOW_CH        6
-#define ICE_RX1          16   // UART1 RX (from ICE TX) OR from UI (when tail)
-#define ICE_TX1          17   // UART1 TX (to ICE RX) OR to UI (when tail)
+#define ICE_RX1          16
+#define ICE_TX1          17
 #define MAX_TAG_ID       1024
 #define HELLO_PERIOD_MS  2000
 #define FLUSH_PERIOD_MS  600
 #define ICE_READ_BUDGET  48
 
-// ----------------- Globals -----------------
 Preferences prefs;
 bool isTail = false;
 uint8_t roomNo = 0;
@@ -44,7 +42,6 @@ static uint8_t bestStr[MAX_TAG_ID + 1];
 static uint32_t lastHello = 0;
 static uint32_t lastFlush = 0;
 
-// ----------------- Utils -----------------
 static inline void macToStr(const uint8_t mac[6], char out[18]) {
   sprintf(out, "%02X:%02X:%02X:%02X:%02X:%02X",
           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -70,7 +67,6 @@ static inline bool macIsZero(const uint8_t mac[6]) {
   return true;
 }
 
-// ----------------- Preferences -----------------
 void loadPrefs() {
   prefs.begin("smoke", true);
   isTail = prefs.getBool("tail", false);
@@ -89,12 +85,10 @@ void savePrefs() {
   prefs.end();
 }
 
-// ----------------- ESP-NOW -----------------
 static uint8_t bcastAddr[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 void sendNow(const uint8_t* mac, const char* s) {
   esp_now_send(mac, (const uint8_t*)s, strlen(s));
 }
-
 bool addPeer(const uint8_t mac[6]) {
   if (macIsZero(mac)) return false;
   esp_now_peer_info_t p = {};
@@ -109,7 +103,6 @@ void ensurePeers() {
   if (!macIsZero(nextMac)) addPeer(nextMac);
 }
 
-// ----------------- HELLO -----------------
 void sendHello() {
   uint8_t my[6]; WiFi.macAddress(my);
   char mstr[18]; macToStr(my, mstr);
@@ -121,7 +114,6 @@ void sendHello() {
   sendNow(bcastAddr, buf);
 }
 
-// ----------------- Aggregation -----------------
 void forwardAggOrPrint() {
   String out; out.reserve(256);
   out += "AGG:";
@@ -141,21 +133,15 @@ void forwardAggOrPrint() {
       String ui = "UI: " + out.substring(4);
       SICE.println(ui);
     }
-  } else {
-    if (!macIsZero(nextMac)) {
-      ensurePeers();
-      sendNow(nextMac, out.c_str());
-    }
+  } else if (!macIsZero(nextMac)) {
+    ensurePeers();
+    sendNow(nextMac, out.c_str());
   }
   for (int i = 1; i <= MAX_TAG_ID; i++) {
-    if (bestStr[i] > 0) {
-      if (bestStr[i] > 2) bestStr[i] -= 2;
-      else bestStr[i] = 0;
-    }
+    if (bestStr[i] > 0) bestStr[i] = (bestStr[i] > 2) ? bestStr[i]-2 : 0;
   }
 }
 
-// ----------------- UART Parsing -----------------
 bool parseTagLine(const String& line, int &tag, int &rssi) {
   if (line.length() < 5) return false;
   if (line[0] == 'T') {
@@ -181,6 +167,7 @@ void pumpUART1() {
       String s = iceLine; iceLine = "";
       s.trim();
       if (!s.length()) continue;
+
       if (isTail) {
         if (s.startsWith("CFG:")) {
           ensurePeers();
@@ -190,9 +177,7 @@ void pumpUART1() {
         int tag, rssi;
         if (parseTagLine(s, tag, rssi)) {
           uint8_t st = rssiToStrength(rssi);
-          if (tag >= 1 && tag <= MAX_TAG_ID) {
-            if (st > bestStr[tag]) bestStr[tag] = st;
-          }
+          if (tag >= 1 && tag <= MAX_TAG_ID && st > bestStr[tag]) bestStr[tag] = st;
         }
       }
     } else if (c != '\r') {
@@ -202,8 +187,9 @@ void pumpUART1() {
   }
 }
 
-// ----------------- ESP-NOW Callbacks -----------------
+// ---- ESP-NOW callbacks (IDF v5 / Arduino 3.3.0 signatures) ----
 void onRecv(const esp_now_recv_info* info, const uint8_t* data, int len) {
+  (void)info;
   if (!data || len <= 0) return;
   String msg; msg.reserve(len+1);
   for (int i=0; i<len; i++) msg += (char)data[i];
@@ -216,7 +202,7 @@ void onRecv(const esp_now_recv_info* info, const uint8_t* data, int len) {
       m.trim();
       uint8_t tmac[6]; if (strToMac(m, tmac)) {
         uint8_t my[6]; WiFi.macAddress(my);
-        if (memcmp(tmac, my, 6) != 0) return;
+        if (memcmp(tmac, my, 6) != 0) return; // not for me
       }
     }
     int p = 4;
@@ -226,27 +212,22 @@ void onRecv(const esp_now_recv_info* info, const uint8_t* data, int len) {
       int eq = kv.indexOf('=');
       String k = (eq > 0)? kv.substring(0,eq) : kv;
       String v = (eq > 0)? kv.substring(eq+1) : "1";
-      if (k == "room") {
-        int r = v.toInt(); if (r>=0 && r<=255) roomNo = (uint8_t)r;
-      } else if (k == "tail") {
-        isTail = (v.toInt()!=0);
-      } else if (k == "next") {
-        if (!strToMac(v, nextMac)) memset(nextMac, 0, 6);
-      } else if (k == "clear") {
-        isTail = false; roomNo = 0; memset(nextMac,0,6);
-      }
+      if (k == "room")       { int r = v.toInt(); if (r>=0 && r<=255) roomNo = (uint8_t)r; }
+      else if (k == "tail")  { isTail = (v.toInt()!=0); }
+      else if (k == "next")  { if (!strToMac(v, nextMac)) memset(nextMac, 0, 6); }
+      else if (k == "clear") { isTail = false; roomNo = 0; memset(nextMac,0,6); }
       p = c+1;
     }
     savePrefs();
     return;
   }
+
   if (msg.startsWith("AGG:")) {
     int p = 4;
     while (p < msg.length()) {
       int c = msg.indexOf(',', p); if (c<0) c = msg.length();
       String tok = msg.substring(p, c); tok.trim();
-      int dot = tok.indexOf('.');
-      int at  = tok.indexOf('@');
+      int dot = tok.indexOf('.'); int at = tok.indexOf('@');
       if (dot > 0 && at > dot) {
         int tag = tok.substring(dot+1,at).toInt();
         int str = tok.substring(at+1).toInt();
@@ -259,11 +240,12 @@ void onRecv(const esp_now_recv_info* info, const uint8_t* data, int len) {
     }
   }
 }
-void onSent(const uint8_t* mac_addr, esp_now_send_status_t status) {
-  (void)mac_addr; (void)status;
+
+// *** FIXED signature here ***
+void onSent(const uint8_t* mac_addr, wifi_tx_info_t* tx, esp_now_send_status_t status) {
+  (void)mac_addr; (void)tx; (void)status;
 }
 
-// ----------------- Setup / Loop -----------------
 void setup() {
   Serial.begin(115200);
   SICE.begin(115200, SERIAL_8N1, ICE_RX1, ICE_TX1);
@@ -290,10 +272,6 @@ void setup() {
 void loop() {
   pumpUART1();
   uint32_t now = millis();
-  if (now - lastHello >= HELLO_PERIOD_MS) {
-    lastHello = now; sendHello();
-  }
-  if (now - lastFlush >= FLUSH_PERIOD_MS) {
-    lastFlush = now; forwardAggOrPrint();
-  }
+  if (now - lastHello >= HELLO_PERIOD_MS) { lastHello = now; sendHello(); }
+  if (now - lastFlush >= FLUSH_PERIOD_MS) { lastFlush = now; forwardAggOrPrint(); }
 }
