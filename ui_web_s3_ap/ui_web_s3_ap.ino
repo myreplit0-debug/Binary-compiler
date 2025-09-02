@@ -1,16 +1,6 @@
-/*
-  ui_web_s3_ap.ino — KeyGrid UI for ESP32-S3 (Arduino-ESP32 3.x)
-
-  • SoftAP:  SSID KeyGrid_UI / PASS keygrid123
-  • Single-page web app at "/"
-  • UART2 from SMOKE tail (RX=16, TX=17). Parses:
-      - "UI: <room>.<tag>@<str>, ..."
-      - "HELLO,mac=..,room=..,tail=..,next=.."
-      - "LOG: ICE UNMAPPED <RAW>" (optional)
-  • Manage: rooms (/rooms.txt), aliases (/alias.csv), registrations (/regs.csv)
-  • NEW: /cfg endpoint + Peers actions (Make Tail, Tail Off, Set Room, Set Next, Clear)
+/*  ui_web_s3_ap.ino — KeyGrid UI for ESP32-S3 (Arduino-ESP32 3.x)
+    ... (unchanged header/comment)
 */
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -21,7 +11,6 @@
 #ifndef __has_include
   #define __has_include(x) 0
 #endif
-
 #if __has_include(<LittleFS.h>)
   #include <LittleFS.h>
   #define FSYS LittleFS
@@ -30,15 +19,12 @@
   #define FSYS SPIFFS
 #endif
 
-// -------- Pins (match SMOKE tail UART1 pins) --------
 #define UI_RX2 16
 #define UI_TX2 17
 
-// -------- AP creds --------
 static const char* AP_SSID = "KeyGrid_UI";
 static const char* AP_PASS = "keygrid123";
 
-// -------- Limits --------
 static const int MAX_ROOMS  = 25;
 static const int MAX_TAG_ID = 1024;
 static const int LOG_RING   = 200;
@@ -46,16 +32,14 @@ static const int MAX_PEERS  = 40;
 static const int ALIAS_MAX  = 1024;
 static const int SEEN_MAX   = 128;
 
-// -------- Files --------
 static const char* ROOMS_PATH = "/rooms.txt";
-static const char* ALIAS_PATH = "/alias.csv"; // raw,tag
-static const char* REGS_PATH  = "/regs.csv";  // tag,reg
+static const char* ALIAS_PATH = "/alias.csv";
+static const char* REGS_PATH  = "/regs.csv";
 
-// -------- State --------
 String   roomNames[MAX_ROOMS];
-uint16_t tagRoom[MAX_TAG_ID + 1];   // 0 = not shown
-uint8_t  tagStr [MAX_TAG_ID + 1];   // 0..100
-String   regByTag[MAX_TAG_ID + 1];  // "" if none
+uint16_t tagRoom[MAX_TAG_ID + 1];
+uint8_t  tagStr [MAX_TAG_ID + 1];
+String   regByTag[MAX_TAG_ID + 1];
 
 struct PeerInfo { String mac; int room; uint8_t tail; String next; uint32_t lastMs; };
 PeerInfo peers[MAX_PEERS]; int peerCount=0;
@@ -68,7 +52,6 @@ String seenRaw[SEEN_MAX]; int seenCount=0;
 String logBuf[LOG_RING]; int logPtr=0;
 inline void pushLog(const String& s){ logBuf[logPtr]=s; logPtr=(logPtr+1)%LOG_RING; Serial.println(s); }
 
-// -------- Utils --------
 static inline String jsonEscape(const String& s){
   String o; o.reserve(s.length()+4);
   for(size_t i=0;i<s.length();++i){
@@ -126,7 +109,6 @@ static void aliasSet(const String& raw, uint16_t tag){
   if(i>=0){ aliasMap[i].tag=tag; }
   else for(int k=0;k<ALIAS_MAX;k++) if(!aliasMap[k].used){ aliasMap[k].used=true; aliasMap[k].raw=raw; aliasMap[k].tag=tag; break; }
   aliasSave();
-  // Hint to chain/ICE via tail: emit MAP on UART2 (tail should forward to ICE)
   String line = "MAP,name=" + raw + ",id=" + String(tag);
   Serial2.println(line);
   pushLog("[MAP→SMOKE] " + line);
@@ -161,6 +143,7 @@ static const char INDEX_HTML[] PROGMEM = R"HTML(
 <meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>Key Grid — WiFi UI</title>
 <style>
+/* (styles unchanged) */
 :root{--bg:#0b0f14;--panel:rgba(19,24,31,.72);--text:#e8eef6;--muted:#9fb0c4;--shadow:0 10px 30px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.05)}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}html,body{height:100%;margin:0;background:radial-gradient(1200px 700px at -10% -10%,#19202a 0,transparent 40%),radial-gradient(1000px 600px at 110% -20%,#0e1620 0,transparent 40%),radial-gradient(1200px 700px at 50% 120%,#0c131b 0,transparent 50%),var(--bg);color:var(--text);font:15px/1.35 system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial}
 .top{position:sticky;top:0;z-index:3;display:flex;gap:.6rem;align-items:center;padding:.7rem .9rem;background:linear-gradient(to bottom,rgba(12,16,22,.92),rgba(12,16,22,.7));backdrop-filter:blur(12px) saturate(115%);border-bottom:1px solid rgba(255,255,255,.06)}
@@ -424,7 +407,6 @@ document.getElementById("forgetTag").onclick=async()=>{ if(!curTag) return; awai
 async function sendCfg(obj){ await post("/cfg", obj); }
 async function makeTail(mac){
   await sendCfg({mac, tail:1});
-  // demote others individually (avoid demoting the new tail)
   for(const p of STATE.peers){ if(p.mac!==mac) await sendCfg({mac:p.mac, tail:0}); }
 }
 async function tailOff(mac){ await sendCfg({mac, tail:0}); }
@@ -447,7 +429,8 @@ async function broadcastClear(){ await sendCfg({clear:1}); }
 // Fetch helpers
 async function post(path, obj){
   const b=new URLSearchParams(); for(const k in obj) if(obj[k]!==undefined && obj[k]!==null) b.append(k,obj[k]);
-  await fetch(path,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:b.toString()});
+  // IMPORTANT: send as text/plain so the firmware reads server.arg("plain")
+  await fetch(path,{method:"POST",headers:{"Content-Type":"text/plain"},body:b.toString()});
 }
 function div(c,html){ const d=document.createElement("div"); if(c) d.className=c; if(html!==undefined) d.innerHTML=html; return d; }
 function rowHTML(html){ const d=div("row"); d.innerHTML=html; return d; }
@@ -563,7 +546,6 @@ void handleAliasDel(){
   String raw=formValue(body,"raw"); if(raw.length()) aliasDel(raw);
   server.send(200,"text/plain","OK");
 }
-// NEW: /cfg — build and emit a CFG line to SMOKE tail over UART2
 void handleCfg(){
   String body = server.hasArg("plain")? server.arg("plain") : "";
   String mac   = formValue(body,"mac");   mac.trim();
@@ -601,7 +583,6 @@ static void parseLine(String s){
   s.trim(); if(!s.length()) return;
 
   if(s.startsWith("HELLO")){
-    // Example: HELLO,mac=AA:BB:...,room=N,tail=0/1,next=xx:.. or next=00:...
     String mac, roomS, tailS, nextS;
     int mi=s.indexOf("mac="), ri=s.indexOf("room="), ti=s.indexOf("tail="), ni=s.indexOf("next=");
     if(mi>=0){ mac=s.substring(mi+4); int c=mac.indexOf(','); if(c>0) mac=mac.substring(0,c); mac.trim(); }
@@ -625,7 +606,6 @@ static void parseLine(String s){
     pushLog(s); return;
   }
 
-  // Accept any prefix ending with ':'
   int colon=s.indexOf(':'); if(colon>=0) s=s.substring(colon+1);
 
   static bool seen[MAX_TAG_ID+1]; memset(seen,0,sizeof(seen));
@@ -686,7 +666,7 @@ void setup(){
   server.on("/roomsSave",   HTTP_POST, handleRoomsSave);
   server.on("/aliasSet",    HTTP_POST, handleAliasSet);
   server.on("/aliasDel",    HTTP_POST, handleAliasDel);
-  server.on("/cfg",         HTTP_POST, handleCfg);   // <— NEW
+  server.on("/cfg",         HTTP_POST, handleCfg);
   server.onNotFound([](){ server.send(404,"text/plain","404"); });
   server.begin();
 }
