@@ -1,6 +1,7 @@
 // UI controller (ESP32-S3) — ESP-NOW only, Serial CLI
-// Dynamic chain: UI's `chain` command sets idx/next and broadcasts slots=N.
-// Prints final REPORTs from the tail with reg labels.
+// - Prints REPORTs from tail to USB Serial
+// - Manages chain (idx/next/slots, tail), rooms, and tag registry
+// - Works with SMOKE/ICE sketches below
 //
 // Build FQBN: esp32:esp32:esp32s3
 
@@ -10,6 +11,7 @@
 #include <esp_now.h>
 #include <unordered_map>
 #include <vector>
+#include <array>
 
 #define ESPNOW_CH 6
 
@@ -85,14 +87,14 @@ static void help(){
   Serial.println(F(
     "\nUI CLI:\n"
     "  peers                         - list nodes\n"
-    "  chain MAC1,MAC2,...           - make linear chain; assigns idx 1..N, next, tail=last, slots=N\n"
+    "  chain MAC1,MAC2,...           - linear chain; idx 1..N, next hops, tail=last, slots=N\n"
     "  tail  <MAC>                   - set tail on node; demote others\n"
-    "  room  <MAC> <N>               - set room number on node (0..255)\n"
+    "  room  <MAC> <N>               - set room number (0..255)\n"
     "  idx   <MAC> <I>               - set chain index (1..N)\n"
     "  next  <MAC> <NEXTMAC>         - set upstream hop\n"
-    "  slots <N>                     - broadcast total slots=N (dynamic TDMA)\n"
-    "  map   <RAW_NAME> <TAG_ID>     - register RAW->id and broadcast\n"
-    "  reg   <TAG_ID> <REG_TEXT>     - registration label for printing\n"
+    "  slots <N>                     - broadcast total slots for TDMA\n"
+    "  map   <RAW_NAME> <TAG_ID>     - RAW->ID (1..2048); broadcast\n"
+    "  reg   <TAG_ID>    <REG_TEXT>  - label for printing (UI only)\n"
     "  ping                          - nodes reply INFO:ok\n"
   ));
 }
@@ -115,15 +117,12 @@ static void doChain(const String& csv){
     p=c+1;
   }
   if(list.empty()){ Serial.println("chain: no valid MACs"); return; }
-  // assign idx & next
   for(size_t i=0;i<list.size();++i){
     char nxt[18]; if(i+1<list.size()) macToStr(list[i+1].data(),nxt); else strcpy(nxt,"00:00:00:00:00:00");
     cfgKV_target(list[i].data(), "idx="+String((int)(i+1)));
     cfgKV_target(list[i].data(), String("next=")+nxt);
   }
-  // slots = N for all
   bcastKV("slots="+String((int)list.size()));
-  // tail = last; others demoted
   memcpy(tailMac, list.back().data(),6); haveTail=true;
   cfgKV_target(tailMac, "tail=1"); bcastKV("tail=0");
   Serial.printf("chain: %u nodes, tail set to last, slots broadcast\n",(unsigned)list.size());
@@ -131,7 +130,6 @@ static void doChain(const String& csv){
 
 static void handleCLI(const String& line){
   if (!line.length()) return;
-  // split
   std::vector<String> v; int p=0; while(p<(int)line.length()){ int s=line.indexOf(' ',p); if(s<0)s=line.length(); String t=line.substring(p,s); if(t.length()) v.push_back(t); p=s+1; }
   if (v.empty()) return;
 
@@ -183,13 +181,11 @@ void setup(){
   Serial.println("\n[UI] ready. Type 'help'.");
 }
 void loop(){
-  // read CLI
   static String buf;
   while(Serial.available()){
     char c=(char)Serial.read();
     if (c=='\n'||c=='\r'){ buf.trim(); if(buf.length()) handleCLI(buf); buf=""; }
     else buf+=c;
   }
-  // discovery ping
   static uint32_t last=0; if (millis()-last>2000){ last=millis(); sendBcast("HELLO?"); }
 }
