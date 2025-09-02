@@ -15,6 +15,11 @@
 #include <WebServer.h>
 #include <FS.h>
 #include <string.h>
+#include <stdlib.h>
+
+#ifndef __has_include
+  #define __has_include(x) 0
+#endif
 
 #if __has_include(<LittleFS.h>)
   #include <LittleFS.h>
@@ -355,8 +360,7 @@ async function aliasSet(){
   pollOnce();
 }
 async function aliasDel(){
-  const raw = document.getElementById("rawIn").value.trim();
-  if(!raw) return;
+  const raw=document.getElementById("rawIn").value.trim(); if(!raw) return;
   await post("/aliasDel",{raw});
   document.getElementById("aliasMsg").textContent="Alias deleted.";
   setTimeout(()=>document.getElementById("aliasMsg").textContent="",1500);
@@ -366,96 +370,227 @@ async function aliasDel(){
 // Drawer
 let curTag=null;
 const drawer=document.getElementById("drawer");
-const dTag=document.getElementById("dTag"),
-      dRoom=document.getElementById("dRoom"),
-      dStr=document.getElementById("dStr");
-const dReg=document.getElementById("dReg"),
-      dMove=document.getElementById("dMove");
-
-function openDrawer(t){
-  curTag=t.id;
-  dTag.textContent=t.id;
-  dRoom.textContent=t.room;
-  dStr.textContent=t.str;
-  dReg.value=t.reg||"";
-  dMove.value="";
-  drawer.classList.add("open");
-}
+const dTag=document.getElementById("dTag"), dRoom=document.getElementById("dRoom"), dStr=document.getElementById("dStr");
+const dReg=document.getElementById("dReg"), dMove=document.getElementById("dMove");
+function openDrawer(t){curTag=t.id; dTag.textContent=t.id; dRoom.textContent=t.room; dStr.textContent=t.str; dReg.value=t.reg||""; dMove.value=""; drawer.classList.add("open");}
 document.getElementById("closeDrawer").onclick=()=>drawer.classList.remove("open");
-document.getElementById("saveReg").onclick=async()=>{
-  if(!curTag) return;
-  await post("/setReg",{tag:curTag,reg:dReg.value.trim()});
-  drawer.classList.remove("open");
-  pollOnce();
-};
-document.getElementById("clearReg").onclick=async()=>{
-  if(!curTag) return;
-  await post("/setReg",{tag:curTag,reg:""});
-  drawer.classList.remove("open");
-  pollOnce();
-};
-document.getElementById("doMove").onclick=async()=>{
-  if(!curTag) return;
-  const r=parseInt(dMove.value||"0");
-  if(r>0) await post("/moveTag",{tag:curTag,room:r});
-  drawer.classList.remove("open");
-  pollOnce();
-};
-document.getElementById("forgetTag").onclick=async()=>{
-  if(!curTag) return;
-  await post("/forgetTag",{tag:curTag});
-  drawer.classList.remove("open");
-  pollOnce();
-};
+document.getElementById("saveReg").onclick=async()=>{ if(!curTag) return; await post("/setReg",{tag:curTag,reg:dReg.value.trim()}); drawer.classList.remove("open"); pollOnce(); };
+document.getElementById("clearReg").onclick=async()=>{ if(!curTag) return; await post("/setReg",{tag:curTag,reg:""}); drawer.classList.remove("open"); pollOnce(); };
+document.getElementById("doMove").onclick=async()=>{ if(!curTag) return; const r=parseInt(dMove.value||"0"); if(r>0) await post("/moveTag",{tag:curTag,room:r}); drawer.classList.remove("open"); pollOnce(); };
+document.getElementById("forgetTag").onclick=async()=>{ if(!curTag) return; await post("/forgetTag",{tag:curTag}); drawer.classList.remove("open"); pollOnce(); };
 
-// Fetch/helpers
+// Fetch helpers
 async function post(path, obj){
-  const b=new URLSearchParams();
-  for(const k in obj) b.append(k,obj[k]);
-  await fetch(path,{
-    method:"POST",
-    headers:{"Content-Type":"application/x-www-form-urlencoded"},
-    body:b.toString()
-  });
+  const b=new URLSearchParams(); for(const k in obj) b.append(k,obj[k]);
+  await fetch(path,{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:b.toString()});
 }
-function div(c,html){
-  const d=document.createElement("div");
-  if(c) d.className=c;
-  if(html!==undefined) d.innerHTML=html;
-  return d;
-}
-function rowHTML(html){
-  const d=div("row");
-  d.innerHTML=html;
-  return d;
-}
-function rowText(t,extra){
-  const d=div("row"+(extra?(" "+extra):""));
-  d.textContent=t;
-  return d;
-}
+function div(c,html){ const d=document.createElement("div"); if(c) d.className=c; if(html!==undefined) d.innerHTML=html; return d; }
+function rowHTML(html){ const d=div("row"); d.innerHTML=html; return d; }
+function rowText(t,extra){ const d=div("row"+(extra?(" "+extra):"")); d.textContent=t; return d; }
 
 // Polling
 async function poll(){
   try{
     const r=await fetch("/state.json",{cache:"no-store"});
-    if(r.ok){
-      STATE=await r.json();
-      document.getElementById("status").textContent=STATE.status||"online";
-      renderGrid(); renderPeers(); renderLogs();
-    }
+    if(r.ok){ STATE=await r.json(); document.getElementById("status").textContent=STATE.status||"online"; renderGrid(); renderPeers(); renderLogs(); }
   }catch(e){}
   setTimeout(poll,500);
 }
-async function pollOnce(){
-  try{
-    const r=await fetch("/state.json",{cache:"no-store"});
-    if(r.ok){
-      STATE=await r.json();
-      renderGrid(); renderPeers(); renderLogs(); renderManage();
-    }
-  }catch(e){}
-}
+async function pollOnce(){ try{ const r=await fetch("/state.json",{cache:"no-store"}); if(r.ok){ STATE=await r.json(); renderGrid(); renderPeers(); renderLogs(); renderManage(); } }catch(e){} }
 
 poll();
 </script>
+)HTML";
+
+// -------- small helpers --------
+static String formValue(const String& body, const char* key){
+  String k=String(key)+'=';
+  int p=body.indexOf(k); if(p<0) return "";
+  int e=body.indexOf('&', p+k.length()); if(e<0) e=body.length();
+  String v = body.substring(p+k.length(), e); v.replace("+"," ");
+  String o; o.reserve(v.length());
+  for(size_t i=0;i<v.length();++i){
+    if(v[i]=='%' && i+2<v.length()){ int v8=strtol(v.substring(i+1,i+3).c_str(),nullptr,16); o+=(char)v8; i+=2; }
+    else o+=v[i];
+  }
+  return o;
+}
+static void sendStatus(){
+  pushLog(String("[AP] ")+AP_SSID+"  IP: "+WiFi.softAPIP().toString());
+}
+
+// -------- HTTP handlers --------
+void handleStateJson(){
+  WiFiClient client = server.client();
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+
+  String s = "{\"status\":\"AP "+String(AP_SSID)+" | UART feed\",\"roomNames\":[";
+  for(int i=0;i<MAX_ROOMS;i++){ if(i) s+=','; s+='\"'+jsonEscape(roomNames[i])+'\"'; }
+  s += "],\"tags\":[";
+  bool first=true;
+  for(int id=1; id<=MAX_TAG_ID; id++){
+    if(tagRoom[id]){
+      if(!first) s+=','; first=false;
+      s += "{\"id\":"+String(id)+",\"room\":"+String(tagRoom[id])+",\"str\":"+String(tagStr[id])+",\"reg\":\""+jsonEscape(regByTag[id])+"\"}";
+    }
+  }
+  s += "],\"peers\":[";
+  for(int i=0;i<peerCount;i++){ if(i) s+=','; uint32_t ago=(millis()-peers[i].lastMs)/1000;
+    s += "{\"mac\":\""+jsonEscape(peers[i].mac)+"\",\"room\":"+String(peers[i].room)+",\"ago\":\""+String(ago)+"s\"}";
+  }
+  s += "],\"logs\":[";
+  bool f2=true; for(int i=0;i<LOG_RING;i++){ int idx=(logPtr+i)%LOG_RING; if(logBuf[idx].length()){
+    if(!f2) s+=','; f2=false; s+='\"'+jsonEscape(logBuf[idx])+'\"'; } }
+  s += "],\"seenRaw\":[";
+  for(int i=0;i<seenCount;i++){ if(i) s+=','; s+='\"'+jsonEscape(seenRaw[i])+'\"'; }
+  s += "]}";
+  client.print(s);
+}
+void handleSetReg(){
+  String body = server.hasArg("plain")? server.arg("plain") : "";
+  int id  = formValue(body,"tag").toInt();
+  String reg = formValue(body,"reg");
+  if(id>=1 && id<=MAX_TAG_ID){ regByTag[id]=reg; regsSave(); pushLog(String("[REG] tag ")+id+" = "+reg); }
+  server.send(200,"text/plain","OK");
+}
+void handleMoveTag(){
+  String body = server.hasArg("plain")? server.arg("plain") : "";
+  int id=formValue(body,"tag").toInt();
+  int room=formValue(body,"room").toInt();
+  if(id>=1 && id<=MAX_TAG_ID && room>=1 && room<=MAX_ROOMS){ tagRoom[id]=room; pushLog(String("[MOVE] tag ")+id+" -> room "+room); }
+  server.send(200,"text/plain","OK");
+}
+void handleForgetTag(){
+  String body = server.hasArg("plain")? server.arg("plain") : "";
+  int id=formValue(body,"tag").toInt();
+  if(id>=1 && id<=MAX_TAG_ID){ tagRoom[id]=0; tagStr[id]=0; pushLog(String("[FORGET] tag ")+id); }
+  server.send(200,"text/plain","OK");
+}
+void handleSetRoom(){
+  String body = server.hasArg("plain")? server.arg("plain") : "";
+  int idx=formValue(body,"idx").toInt();
+  String nm=formValue(body,"name");
+  if(idx>=1 && idx<=MAX_ROOMS){ roomNames[idx-1]=nm; pushLog(String("[ROOM] ")+idx+" = "+nm); }
+  server.send(200,"text/plain","OK");
+}
+void handleRoomsSave(){
+  String body = server.hasArg("plain")? server.arg("plain") : "";
+  String j = formValue(body,"json");
+  if(j.length()){
+    int i=0, r=0; while(i<(int)j.length() && r<MAX_ROOMS){
+      int q1=j.indexOf('"', i); if(q1<0) break; int q2=j.indexOf('"', q1+1); if(q2<0) break;
+      roomNames[r++] = j.substring(q1+1,q2);
+      i = q2+1;
+    }
+  }
+  roomsSave();
+  server.send(200,"text/plain","OK");
+}
+void handleAliasSet(){
+  String body = server.hasArg("plain")? server.arg("plain") : "";
+  String raw=formValue(body,"raw"); uint16_t tag=(uint16_t)formValue(body,"tag").toInt();
+  if(raw.length() && tag>0){ aliasSet(raw, tag); }
+  server.send(200,"text/plain","OK");
+}
+void handleAliasDel(){
+  String body = server.hasArg("plain")? server.arg("plain") : "";
+  String raw=formValue(body,"raw"); if(raw.length()) aliasDel(raw);
+  server.send(200,"text/plain","OK");
+}
+
+// -------- UART2 parsing --------
+volatile bool u2Flag=false; String u2Q;
+
+static void parseLine(String s){
+  s.trim(); if(!s.length()) return;
+
+  if(s.startsWith("HELLO")){
+    String mac, roomS; int mi=s.indexOf("mac="), ri=s.indexOf("room=");
+    if(mi>=0){ mac=s.substring(mi+4); int c=mac.indexOf(','); if(c>0) mac=mac.substring(0,c); }
+    if(ri>=0){ roomS=s.substring(ri+5); int c=roomS.indexOf(','); if(c>0) roomS=roomS.substring(0,c); }
+    int room=roomS.toInt();
+    int idx=-1; for(int i=0;i<peerCount;i++) if(peers[i].mac==mac){ idx=i; break; }
+    if(idx<0 && peerCount<MAX_PEERS){ idx=peerCount++; peers[idx].mac=mac; peers[idx].room=0; peers[idx].lastMs=0; }
+    if(idx>=0){ peers[idx].lastMs=millis(); if(room>0) peers[idx].room=room; }
+    pushLog(s); return;
+  }
+
+  if(s.startsWith("LOG: ICE UNMAPPED ")){
+    String raw = s.substring(strlen("LOG: ICE UNMAPPED ")); raw.trim();
+    if(raw.length()){
+      bool have=false; for(int i=0;i<seenCount;i++) if(seenRaw[i]==raw){ have=true; break; }
+      if(!have && seenCount<SEEN_MAX){ seenRaw[seenCount++]=raw; }
+    }
+    pushLog(s); return;
+  }
+
+  // Accept prefix ending with ':'
+  int colon=s.indexOf(':'); if(colon>=0) s=s.substring(colon+1);
+
+  static bool seen[MAX_TAG_ID+1]; memset(seen,0,sizeof(seen));
+  int p=0;
+  while(p<s.length()){
+    int comma=s.indexOf(',',p); if(comma<0) comma=s.length();
+    String tok=s.substring(p,comma); tok.trim();
+    int dot=tok.indexOf('.'); int at=tok.indexOf('@');
+    if(dot>0 && at>dot){
+      int roomId=tok.substring(0,dot).toInt();
+      int tagId =tok.substring(dot+1,at).toInt();
+      int str   =tok.substring(at+1).toInt();
+      if(roomId>=1 && roomId<=MAX_ROOMS && tagId>=1 && tagId<=MAX_TAG_ID){
+        if(str<0) str=0; if(str>100) str=100;
+        tagRoom[tagId]=roomId; tagStr[tagId]=str; seen[tagId]=true;
+      }
+    }
+    p=comma+1;
+  }
+  pushLog("[UI] update received");
+}
+static void pumpUART2(){
+  while(Serial2.available()){
+    char c=(char)Serial2.read();
+    if(c=='\n') u2Flag=true;
+    if(c!='\r') u2Q+=c;
+    if(u2Q.length()>4096) u2Q.remove(0,1024);
+  }
+  if(u2Flag){
+    u2Flag=false;
+    while(true){
+      int nl=u2Q.indexOf('\n'); if(nl<0) break;
+      String line=u2Q.substring(0,nl); u2Q.remove(0,nl+1);
+      parseLine(line);
+    }
+  }
+}
+
+// -------- Setup / Loop --------
+void setup(){
+  Serial.begin(115200);
+  Serial2.begin(115200, SERIAL_8N1, UI_RX2, UI_TX2);
+
+  FSYS.begin(true);
+  roomsLoad(); aliasLoad(); regsLoad();
+  for(int i=1;i<=MAX_TAG_ID;i++){ tagRoom[i]=0; tagStr[i]=0; }
+
+  WiFi.mode(WIFI_AP);
+  (void)WiFi.softAP(AP_SSID, AP_PASS);
+  pushLog(String("[UI] AP ready: http://")+WiFi.softAPIP().toString()+"/");
+
+  server.on("/", HTTP_GET, [](){ server.send_P(200,"text/html; charset=utf-8", INDEX_HTML); });
+  server.on("/state.json",  HTTP_GET, handleStateJson);
+  server.on("/setReg",      HTTP_POST, handleSetReg);
+  server.on("/moveTag",     HTTP_POST, handleMoveTag);
+  server.on("/forgetTag",   HTTP_POST, handleForgetTag);
+  server.on("/setRoom",     HTTP_POST, handleSetRoom);
+  server.on("/roomsSave",   HTTP_POST, handleRoomsSave);
+  server.on("/aliasSet",    HTTP_POST, handleAliasSet);
+  server.on("/aliasDel",    HTTP_POST, handleAliasDel);
+  server.onNotFound([](){ server.send(404,"text/plain","404"); });
+  server.begin();
+}
+
+void loop(){
+  pumpUART2();
+  server.handleClient();
+}
