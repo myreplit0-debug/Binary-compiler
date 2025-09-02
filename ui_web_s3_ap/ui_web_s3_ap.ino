@@ -1,22 +1,22 @@
 /*
-  ui_web_s3_ap.ino — FULL UI
-  ESP32-S3 “UI Brain” with Wi-Fi Web UI + UART2 feed from tail SMOKE.
+  ui_web_s3_ap.ino — KeyGrid UI for ESP32-S3 (Arduino-ESP32 3.x)
 
-  - SoftAP:  SSID: KeyGrid_UI   PASS: keygrid123
-  - Single page app at "/"
-  - Browser polls /state.json (500ms)
-  - Reads UART2 lines from SMOKE tail:
-      "UI: r.t@S, ..." (snapshot)
-      "HELLO,mac=AA:BB:...,room=N"
-      "LOG: ICE UNMAPPED <RAW>"  (for alias helper)
-  - Edit on the same page:
-      • Set/Clear registration for a tag  (persist /regs.csv)
-      • Move/Forget tag (UI-local)
-      • Rename rooms (persist /rooms.txt)
-      • Map RAW → tag alias (persist /alias.csv and send MAP over Serial2)
+  What it does
+  • Starts a Wi-Fi SoftAP:  SSID: KeyGrid_UI   PASS: keygrid123
+  • Hosts a single-page web app at "/"
+  • Reads UART2 from SMOKE tail (pins below) and parses:
+      - "UI: <room>.<tag>@<str>, ..." snapshots
+      - "HELLO,mac=AA:BB:...,room=N,tail=..."
+      - "LOG: ICE UNMAPPED <RAW>" (optional; shows in “Manage” for aliasing)
+  • Lets you:
+      - Rename rooms (persist /rooms.txt)
+      - Map RAW→tag (persist /alias.csv) — also sends MAP line back over UART2
+      - Set/clear registration strings per tag (persist /regs.csv)
+      - Move/forget tags (UI-local only; smoke keeps doing its job)
 
-  Hardware: ESP32-S3 Dev Module
-  UART2: RX2=16 (from SMOKE TX), TX2=17 (to SMOKE RX, optional but used for MAP)
+  Hardware
+  • Board: ESP32-S3 Dev Module
+  • UART2: RX=16 (from SMOKE TX), TX=17 (to SMOKE RX; used to send MAP lines)
 */
 
 #include <Arduino.h>
@@ -24,7 +24,6 @@
 #include <WebServer.h>
 #include <FS.h>
 
-// ----- FS backend: LittleFS preferred, fallback to SPIFFS -----
 #if __has_include(<LittleFS.h>)
   #include <LittleFS.h>
   #define FSYS LittleFS
@@ -33,15 +32,15 @@
   #define FSYS SPIFFS
 #endif
 
-// ----- Pins -----
+// -------- Pins (match SMOKE tail UART1 pins) --------
 #define UI_RX2 16
 #define UI_TX2 17
 
-// ----- AP creds -----
+// -------- AP creds --------
 static const char* AP_SSID = "KeyGrid_UI";
 static const char* AP_PASS = "keygrid123";
 
-// ----- Limits -----
+// -------- Limits --------
 static const int MAX_ROOMS  = 25;
 static const int MAX_TAG_ID = 1024;
 static const int LOG_RING   = 200;
@@ -49,14 +48,14 @@ static const int MAX_PEERS  = 40;
 static const int ALIAS_MAX  = 1024;
 static const int SEEN_MAX   = 128;
 
-// ----- Files -----
+// -------- Files --------
 static const char* ROOMS_PATH = "/rooms.txt";
 static const char* ALIAS_PATH = "/alias.csv"; // raw,tag
 static const char* REGS_PATH  = "/regs.csv";  // tag,reg
 
-// ----- State -----
+// -------- State --------
 String   roomNames[MAX_ROOMS];
-uint16_t tagRoom[MAX_TAG_ID + 1];   // 0 = not present
+uint16_t tagRoom[MAX_TAG_ID + 1];   // 0 = not shown
 uint8_t  tagStr [MAX_TAG_ID + 1];   // 0..100
 String   regByTag[MAX_TAG_ID + 1];  // "" if none
 
@@ -71,7 +70,7 @@ String seenRaw[SEEN_MAX]; int seenCount=0;
 String logBuf[LOG_RING]; int logPtr=0;
 inline void pushLog(const String& s){ logBuf[logPtr]=s; logPtr=(logPtr+1)%LOG_RING; Serial.println(s); }
 
-// ----- Utils -----
+// -------- Utils --------
 static inline String jsonEscape(const String& s){
   String o; o.reserve(s.length()+4);
   for(size_t i=0;i<s.length();++i){
@@ -87,7 +86,7 @@ static void setDefaultRooms(){
   for(int i=0;i<MAX_ROOMS;i++) roomNames[i] = (i<10? String(d[i]) : String());
 }
 
-// ----- FS helpers -----
+// -------- FS helpers --------
 static void roomsLoad(){
   for(int i=0;i<MAX_ROOMS;i++) roomNames[i]="";
   File f=FSYS.open(ROOMS_PATH,"r");
@@ -129,7 +128,7 @@ static void aliasSet(const String& raw, uint16_t tag){
   if(i>=0){ aliasMap[i].tag=tag; }
   else for(int k=0;k<ALIAS_MAX;k++) if(!aliasMap[k].used){ aliasMap[k].used=true; aliasMap[k].raw=raw; aliasMap[k].tag=tag; break; }
   aliasSave();
-  // send MAP down to SMOKE chain (optional now, future-proof)
+  // Optional hint back to SMOKE chain (future use)
   String line = "MAP,name=" + raw + ",id=" + String(tag);
   Serial2.println(line);
   pushLog("[MAP→SMOKE] " + line);
@@ -156,10 +155,9 @@ static void regsSave(){
   w.close(); pushLog("[FS] regs saved");
 }
 
-// ----- Web -----
+// -------- Web --------
 WebServer server(80);
 
-// Full single-page UI (with Manage tab + drawer)
 static const char INDEX_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
@@ -340,14 +338,12 @@ function renderLogs(){
 
 // Manage
 function renderManage(){
-  // rooms
   const RW=document.getElementById("roomsWrap"); RW.innerHTML="";
   const rooms=STATE.roomNames.length?STATE.roomNames:Array.from({length:5},(_,i)=>"Room "+(i+1));
   rooms.forEach((nm,i)=>{
     const w=div("",`<label class="input"><input id="rname_${i+1}" value="${nm||("Room "+(i+1))}"></label>`);
     RW.appendChild(w);
   });
-  // seen RAW
   const SW=document.getElementById("seenWrap"); SW.innerHTML="";
   for(const raw of STATE.seenRaw||[]){
     const b=div("chip",raw); b.onclick=()=>{document.getElementById("rawIn").value=raw;};
@@ -414,7 +410,7 @@ poll();
 </script>
 )HTML";
 
-// ------------- tiny helpers -------------
+// -------- small helpers --------
 static String formValue(const String& body, const char* key){
   String k=String(key)+'=';
   int p=body.indexOf(k); if(p<0) return "";
@@ -431,7 +427,9 @@ static void sendStatus(){
   pushLog(String("[AP] ")+AP_SSID+"  IP: "+WiFi.softAPIP().toString());
 }
 
-// ------------- HTTP handlers -------------
+// -------- HTTP handlers --------
+WebServer server(80);
+
 void handleStateJson(){
   WiFiClient client = server.client();
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -487,11 +485,9 @@ void handleSetRoom(){
   server.send(200,"text/plain","OK");
 }
 void handleRoomsSave(){
-  // Expect optional "json=[...]" array of names; if present, apply before save
   String body = server.hasArg("plain")? server.arg("plain") : "";
   String j = formValue(body,"json");
   if(j.length()){
-    // very small JSON parser: expects ["a","b",...]
     int i=0, r=0; while(i<(int)j.length() && r<MAX_ROOMS){
       int q1=j.indexOf('"', i); if(q1<0) break; int q2=j.indexOf('"', q1+1); if(q2<0) break;
       roomNames[r++] = j.substring(q1+1,q2);
@@ -513,7 +509,7 @@ void handleAliasDel(){
   server.send(200,"text/plain","OK");
 }
 
-// ------------- UART2 parsing -------------
+// -------- UART2 parsing --------
 volatile bool u2Flag=false; String u2Q;
 
 static void parseLine(String s){
@@ -539,7 +535,7 @@ static void parseLine(String s){
     pushLog(s); return;
   }
 
-  // Accept "UI:" or "DATA:UI:"
+  // Accept "UI:" (or any prefix ending with ':')
   int colon=s.indexOf(':'); if(colon>=0) s=s.substring(colon+1);
 
   static bool seen[MAX_TAG_ID+1]; memset(seen,0,sizeof(seen));
@@ -578,7 +574,7 @@ static void pumpUART2(){
   }
 }
 
-// ------------- Setup / Loop -------------
+// -------- Setup / Loop --------
 void setup(){
   Serial.begin(115200);
   Serial2.begin(115200, SERIAL_8N1, UI_RX2, UI_TX2);
@@ -590,7 +586,8 @@ void setup(){
 
   WiFi.mode(WIFI_AP);
   bool ok=WiFi.softAP(AP_SSID, AP_PASS);
-  (void)ok; sendStatus();
+  (void)ok;
+  pushLog(String("[UI] AP ready: http://")+WiFi.softAPIP().toString()+"/");
 
   server.on("/", HTTP_GET, [](){ server.send_P(200,"text/html; charset=utf-8", INDEX_HTML); });
   server.on("/state.json",  HTTP_GET, handleStateJson);
@@ -603,8 +600,6 @@ void setup(){
   server.on("/aliasDel",    HTTP_POST, handleAliasDel);
   server.onNotFound([](){ server.send(404,"text/plain","404"); });
   server.begin();
-
-  pushLog("[UI] ready → http://"+WiFi.softAPIP().toString()+"/");
 }
 
 void loop(){
