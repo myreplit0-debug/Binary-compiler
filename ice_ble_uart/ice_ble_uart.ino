@@ -50,7 +50,7 @@ static std::unordered_map<MacKey, uint16_t, MacHash> mac2dev;
 static std::map<uint16_t, String> devNames;
 
 // Device Name (exact match) -> device#
-static std::unordered_map<String, uint16_t> name2dev;
+static std::map<String, uint16_t> name2dev;
 
 // Per-scan best RSSI by device number
 static std::unordered_map<uint16_t, int8_t> bestRssi;
