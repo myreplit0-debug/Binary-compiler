@@ -137,7 +137,7 @@ static bool tlv_append(uint8_t T, const uint8_t* data, uint16_t L) {
   return true;
 }
 
-static bool append_device_record(const BLEAdvertisedDevice& d) {
+static bool append_device_record(BLEAdvertisedDevice& d) {
   String name = d.getName();
   if (name.length() > NAME_MAX_LEN) name = name.substring(0, NAME_MAX_LEN);
   size_t need = (2+6) + (2+1) + (2+1) + (name.length() ? (2+name.length()) : 0);
