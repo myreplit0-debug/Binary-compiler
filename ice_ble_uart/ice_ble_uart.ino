@@ -1,8 +1,9 @@
 /*
-  SMOKE Unified (ESP32-S3) — Receiver/Bridge v1.1
-  - Name-based binding with ASCII sanitization
+  SMOKE Unified (ESP32-S3) — Receiver/Bridge v1.2
+  - Name-based binding with ASCII-prefix sanitization
+  - Helper commands: 'seen' and 'bindseen <idx> <num>'
   - Matching order: sanitized NAME bind > MAC bind
-  - Verbose RX shows RAW and SAN names for clarity
+  - Verbose RX shows RAW and SAN names
 */
 
 #include <Arduino.h>
@@ -10,6 +11,7 @@
 #include <SPIFFS.h>
 #include <map>
 #include <unordered_map>
+#include <vector>
 
 // ====== CONFIG ======
 #define VERBOSE_RX 1
@@ -32,11 +34,15 @@ struct MacHash { size_t operator()(const MacKey& k) const { uint32_t h=(k.b[0]<<
 static std::unordered_map<MacKey, uint16_t, MacHash> mac2dev;
 // device# -> friendly label (optional)
 static std::map<uint16_t, String> devNames;
-// *** Sanitized Name -> device#  (ordered map; Arduino String has no std::hash) ***
+// Sanitized Name -> device#  (ordered map so we avoid hashing Arduino String)
 static std::map<String, uint16_t> name2dev;
 
 // Per-scan strongest RSSI per device
 static std::unordered_map<uint16_t, int8_t> bestRssi;
+
+// Recent sanitized names (for 'seen' list)
+static const size_t SEEN_MAX = 16;
+static std::vector<String> seenNames;
 
 // ====== UTILS ======
 static void macToStr(const uint8_t* m, char out[18]) { sprintf(out,"%02X:%02X:%02X:%02X:%02X:%02X",m[0],m[1],m[2],m[3],m[4],m[5]); }
@@ -47,23 +53,25 @@ static bool parseMac(const String& s, uint8_t out[6]) {
 }
 static String trimQuotes(String s){ s.trim(); if(s.length()>=2 && ((s.startsWith("\"")&&s.endsWith("\""))||(s.startsWith("'")&&s.endsWith("'")))) return s.substring(1,s.length()-1); return s; }
 
-// Sanitize to printable ASCII (32..126). Replace others with '.', collapse multiple spaces, trim ends.
-static String sanitizeAscii(const String& in){
+// Sanitize: keep ASCII 32..126 prefix UNTIL the first non-printable, then stop.
+// Also trim leading/trailing spaces and collapse internal runs of spaces.
+static String sanitizePrefix(const String& in){
   String out; out.reserve(in.length());
-  bool lastSpace=false;
   for (size_t i=0;i<in.length();++i){
     uint8_t c=(uint8_t)in[i];
-    if (c>=32 && c<=126){
-      if (c==' '){ if(!lastSpace) out += ' '; lastSpace=true; }
-      else { out += (char)c; lastSpace=false; }
-    } else {
-      if(!lastSpace){ out += '.'; lastSpace=true; }
-    }
+    if (c<32 || c>126) break; // stop at first weird byte
+    out += (char)c;
   }
-  // trim leading/trailing spaces or dots
-  while(out.length() && (out[0]==' '||out[0]=='.')) out.remove(0,1);
-  while(out.length() && (out[out.length()-1]==' '||out[out.length()-1]=='.')) out.remove(out.length()-1);
-  return out;
+  // trim + collapse spaces
+  out.trim();
+  String collapsed; collapsed.reserve(out.length());
+  bool lastSpace=false;
+  for (size_t i=0;i<out.length(); ++i){
+    char c = out[i];
+    if (c==' '||c=='\t'){ if(!lastSpace){ collapsed+=' '; lastSpace=true; } }
+    else { collapsed+=c; lastSpace=false; }
+  }
+  return collapsed;
 }
 
 static uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t crc=0xFFFF){
@@ -84,6 +92,8 @@ static void loadRoom(){ File f=SPIFFS.open("/room.txt", FILE_READ); if(f){ g_roo
 static void saveTail(){ File f=SPIFFS.open("/tail.txt", FILE_WRITE, true); if(f){ f.printf("%d\n", g_is_tail?1:0); f.close(); } }
 static void loadTail(){ File f=SPIFFS.open("/tail.txt", FILE_READ); if(f){ g_is_tail=(f.readStringUntil('\n').toInt()!=0); f.close(); } }
 
+static String sanitizeForCsv(const String& s){ String o=s; o.replace(","," "); o.replace("\r"," "); o.replace("\n"," "); return o; }
+
 static void saveBinds(){ File f=SPIFFS.open("/binds.csv", FILE_WRITE, true); if(!f) return;
   for(auto& kv: mac2dev){ char mac[18]; macToStr(kv.first.b,mac); f.printf("%s,%u\n",mac,(unsigned)kv.second);} f.close();}
 static void loadBinds(){ mac2dev.clear(); File f=SPIFFS.open("/binds.csv", FILE_READ); if(!f) return;
@@ -92,7 +102,6 @@ static void loadBinds(){ mac2dev.clear(); File f=SPIFFS.open("/binds.csv", FILE_
     uint8_t m[6]; if(!parseMac(smac,m)) continue; MacKey k; memcpy(k.b,m,6); mac2dev[k]=(uint16_t)sn.toInt(); }
   f.close(); }
 
-static String sanitizeForCsv(const String& s){ String o=s; o.replace(","," "); o.replace("\r"," "); o.replace("\n"," "); return o; }
 static void saveNames(){ File f=SPIFFS.open("/names.csv", FILE_WRITE, true); if(!f) return;
   for(auto& kv: devNames) f.printf("%u,%s\n",(unsigned)kv.first,sanitizeForCsv(kv.second).c_str()); f.close();}
 static void loadNames(){ devNames.clear(); File f=SPIFFS.open("/names.csv", FILE_READ); if(!f) return;
@@ -114,18 +123,24 @@ static void printHelp(){
   Serial.println(F("  setroom <n>                 - set this receiver's room number (1..255)"));
   Serial.println(F("  tail on|off                 - mark this receiver as tail (USB output)"));
   Serial.println(F("  bind <MAC> <num>            - map BLE MAC to device number"));
-  Serial.println(F("  bindname <name...> <num>    - map Device Name (sanitized) to device number"));
+  Serial.println(F("  bindname <name...> <num>    - map Device Name (sanitized prefix) -> number"));
+  Serial.println(F("  seen                        - list last 16 sanitized names seen"));
+  Serial.println(F("  bindseen <idx> <num>        - bind 'seen' entry idx to number"));
   Serial.println(F("  name <num> <text...>        - set friendly label"));
   Serial.println(F("  show room|tail|binds|names|namebinds"));
   Serial.println(F("  save                        - persist binds & names"));
-  Serial.println(F("Note: names are sanitized to printable ASCII before matching."));
+  Serial.println(F("Note: names are sanitized to printable ASCII *prefix* before matching."));
 }
+
 static void handleCommand(const String& s){
   int sp=s.indexOf(' '); String cmd=(sp<0)?s:s.substring(0,sp); String rest=(sp<0)?"":s.substring(sp+1); cmd.toLowerCase();
 
   if(cmd=="help"||cmd=="?"){ printHelp(); }
+
   else if(cmd=="setroom"){ uint16_t n=(uint16_t)rest.toInt(); if(n<1||n>255){ Serial.println(F("ERR: room 1..255")); return; } g_room=(uint8_t)n; saveRoom(); Serial.printf("OK room=%u\n", g_room); }
+
   else if(cmd=="tail"){ String r=rest; r.toLowerCase(); if(r=="on"||r=="1"||r=="true") g_is_tail=true; else if(r=="off"||r=="0"||r=="false") g_is_tail=false; else { Serial.println(F("ERR: tail on|off")); return; } saveTail(); Serial.printf("OK tail=%d\n",(int)g_is_tail); }
+
   else if(cmd=="bind"){
     int sp2=rest.indexOf(' '); if(sp2<0){ Serial.println(F("ERR: bind <MAC> <num>")); return; }
     String smac=rest.substring(0,sp2); String sn=rest.substring(sp2+1);
@@ -133,20 +148,41 @@ static void handleCommand(const String& s){
     MacKey k; memcpy(k.b,m,6); mac2dev[k]=(uint16_t)sn.toInt();
     Serial.printf("OK bind %s -> %u\n", smac.c_str(), (unsigned)mac2dev[k]);
   }
+
   else if(cmd=="bindname"){
     int spLast=rest.lastIndexOf(' '); if(spLast<0){ Serial.println(F("ERR: bindname <name...> <num>")); return; }
     String raw = trimQuotes(rest.substring(0, spLast));
     uint16_t id = (uint16_t)rest.substring(spLast+1).toInt(); if(!id){ Serial.println(F("ERR: invalid number")); return; }
-    String san = sanitizeAscii(raw);
+    String san = sanitizePrefix(raw);
+    if(!san.length()){ Serial.println(F("ERR: sanitized name empty")); return; }
     name2dev[san] = id;
     Serial.printf("OK bindname RAW=\"%s\" SAN=\"%s\" -> %u\n", raw.c_str(), san.c_str(), (unsigned)id);
   }
+
+  else if(cmd=="seen"){
+    for (size_t i=0; i<seenNames.size(); ++i) {
+      Serial.printf("[%u] %s\n", (unsigned)i, seenNames[i].c_str());
+    }
+  }
+
+  else if(cmd=="bindseen"){
+    int sp2=rest.indexOf(' '); if(sp2<0){ Serial.println(F("ERR: bindseen <idx> <num>")); return; }
+    int idx = rest.substring(0, sp2).toInt();
+    uint16_t id = (uint16_t)rest.substring(sp2+1).toInt();
+    if (idx < 0 || (size_t)idx >= seenNames.size()){ Serial.println(F("ERR: idx out of range")); return; }
+    String san = seenNames[(size_t)idx];
+    name2dev[san] = id;
+    Serial.printf("OK bindseen [%d] \"%s\" -> %u\n", idx, san.c_str(), (unsigned)id);
+  }
+
   else if(cmd=="name"){
     int sp2=rest.indexOf(' '); if(sp2<0){ Serial.println(F("ERR: name <num> <text...>")); return; }
     uint16_t id=(uint16_t)rest.substring(0,sp2).toInt(); String nm=rest.substring(sp2+1);
     devNames[id]=nm; Serial.printf("OK name %u=\"%s\"\n",(unsigned)id,nm.c_str());
   }
-  else if(cmd=="save"){ saveBinds(); saveNames(); saveNameBinds(); Serial.println(F("OK saved")); }
+
+  else if(cmd=="save"){ File f; saveBinds(); saveNames(); saveNameBinds(); Serial.println(F("OK saved")); }
+
   else if(cmd=="show"){
     String r=rest; r.toLowerCase();
     if(r=="room") Serial.printf("room=%u\n", g_room);
@@ -156,8 +192,10 @@ static void handleCommand(const String& s){
     else if(r=="namebinds"){ for(auto& kv: name2dev){ Serial.printf("\"%s\" -> %u\n", kv.first.c_str(), (unsigned)kv.second); } }
     else Serial.println(F("ERR: show room|tail|binds|names|namebinds"));
   }
+
   else if(cmd.length()){ Serial.println(F("ERR: unknown. Type 'help'.")); }
 }
+
 static void pollUsb(){
   while(Serial.available()){
     static String line; char c=(char)Serial.read();
@@ -172,7 +210,6 @@ static uint8_t frameBuf[FRAME_MAX]; static size_t frameLen=0;
 static const size_t DECODE_MAX = 2000;
 static uint8_t decodeBuf[DECODE_MAX];
 
-static size_t cobs_decode(const uint8_t*, size_t, uint8_t*, size_t); // fwd decl above
 static void processDecodedMessage(const uint8_t* m, size_t n);
 
 static void pollICE(){
@@ -191,6 +228,21 @@ static void pollICE(){
 }
 
 // ====== PARSER ======
+static void addSeen(const String& san){
+  if (!san.length()) return;
+  // de-dup; move to front
+  for (size_t i=0;i<seenNames.size();++i){
+    if (seenNames[i] == san){
+      // move to front
+      if (i!=0){ seenNames.erase(seenNames.begin()+i); seenNames.insert(seenNames.begin(), san); }
+      return;
+    }
+  }
+  // insert at front
+  seenNames.insert(seenNames.begin(), san);
+  if (seenNames.size() > SEEN_MAX) seenNames.pop_back();
+}
+
 static void endOfScanFlush(){
   for(auto &kv: bestRssi){
     Serial.printf("%u.%u@%d\n", (unsigned)g_room, (unsigned)kv.first, (int)kv.second);
@@ -221,9 +273,9 @@ static void processDecodedMessage(const uint8_t* m, size_t n){
     // FLAGS
     if (p+2>end) break; T=m[p++]; L=m[p++]; if(!(T==3 && L==1) || p+1>end) break; p++;
     // NAME
-    String nameRaw; String nameSan;
+    String nameRaw, nameSan;
     if (p+2<=end && m[p]==4){ T=m[p++]; L=m[p++]; if(p+L<=end){ nameRaw = String((const char*)&m[p], L); p+=L; } }
-    if (nameRaw.length()) nameSan = sanitizeAscii(nameRaw);
+    if (nameRaw.length()) nameSan = sanitizePrefix(nameRaw), addSeen(nameSan);
 
     // choose device number: NAME (sanitized) then MAC
     uint16_t devNum = 0xFFFF;
@@ -243,9 +295,7 @@ static void processDecodedMessage(const uint8_t* m, size_t n){
       Serial.print(" RSSI="); Serial.print((int)rssi);
       if (nameRaw.length()){
         Serial.print(" NameRAW=\""); Serial.print(nameRaw); Serial.print("\"");
-        if (nameSan != nameRaw){
-          Serial.print(" SAN=\""); Serial.print(nameSan); Serial.print("\"");
-        }
+        Serial.print(" SAN=\""); Serial.print(nameSan); Serial.print("\"");
       }
       if (devNum!=0xFFFF){ Serial.print(" -> dev "); Serial.println(devNum); }
       else               { Serial.println(" -> (no bind)"); }
