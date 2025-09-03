@@ -343,28 +343,35 @@ static void esn_send_frag(const EsnFrag* hdr, size_t bytes){
   esp_now_send(ESN_BROADCAST, (const uint8_t*)hdr, bytes);
 }
 
-static void forward_upstream(uint8_t src_room, const uint8_t* decoded, size_t n, const uint8_t* origin, uint32_t batch, uint16_t seq){
+// Sends a decoded ICE frame upstream over ESP-NOW in fragments
+static void forward_upstream(uint8_t src_room,
+                             const uint8_t* decoded, size_t n,
+                             const uint8_t* origin, uint32_t batch, uint16_t seq)
+{
   if (!g_esn_on || g_is_tail) return;
-  // Only forward if I'm the originating room, or I'm the next hop (I accept both by accept rule; here we ensure we forward once)
   if (!(src_room == g_room || src_room == (uint8_t)(g_room-1))) return;
 
-  // Fragment and send
-  uint8_t total = (n + ESN_FRAG_DATA_MAX - 1) / ESN_FRAG_DATA_MAX;
+  // Fragment safely without std::min (type mismatch on Xtensa)
+  uint8_t total = (uint8_t)((n + (size_t)ESN_FRAG_DATA_MAX - 1) / (size_t)ESN_FRAG_DATA_MAX);
   if (total == 0) total = 1;
-  for (uint8_t idx=0; idx<total; ++idx){
-    size_t off = idx * ESN_FRAG_DATA_MAX;
-    size_t take = min(ESN_FRAG_DATA_MAX, n - off);
+
+  for (uint8_t idx = 0; idx < total; ++idx) {
+    size_t off  = (size_t)idx * (size_t)ESN_FRAG_DATA_MAX;
+    size_t left = n - off;
+    size_t take = (left < (size_t)ESN_FRAG_DATA_MAX) ? left : (size_t)ESN_FRAG_DATA_MAX;
 
     uint8_t buf[sizeof(EsnFrag) + ESN_FRAG_DATA_MAX];
     EsnFrag* h = (EsnFrag*)buf;
-    h->magic0='S'; h->magic1='M'; h->ver=1;
-    h->src_room = src_room;
-    h->total = total;
-    h->index = idx;
+    h->magic0  = 'S';
+    h->magic1  = 'M';
+    h->ver     = 1;
+    h->src_room= src_room;
+    h->total   = total;
+    h->index   = idx;
     memcpy(h->origin, origin, 6);
-    h->batch = batch;
-    h->seq   = seq;
-    h->frag_len = (uint16_t)take;
+    h->batch   = batch;
+    h->seq     = seq;
+    h->frag_len= (uint16_t)take;
     memcpy(h->data, decoded + off, take);
 
     size_t bytes = sizeof(EsnFrag) + take;
