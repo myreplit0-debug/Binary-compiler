@@ -340,6 +340,12 @@ static bool esn_setup(){
       for (auto &k : seenCache){
         if (k.src_room==sk.src_room && k.batch==sk.batch && k.seq==sk.seq && memcmp(k.origin,sk.origin,6)==0){ duplicate=true; break; }
       }
+
+      Serial.printf("[ESN-RX] complete src_room=%u bytes=%u%s\n",
+                    (unsigned)rb.src_room,
+                    (unsigned)rb.data.size(),
+                    duplicate ? " (duplicate)" : "");
+
       if (!duplicate){
         if (seenCache.size() >= SEEN_CACHE_MAX) seenCache.erase(seenCache.begin());
         seenCache.push_back(sk);
@@ -434,14 +440,22 @@ static void endOfScanFlush(uint8_t flush_room){
 // Process a single decoded ICE message (from UART or ESPNOW)
 void processDecodedMessage(const uint8_t* m, size_t n, uint8_t src_room, bool /*from_esn*/){
   if (n < 1+1+6+4+2+2+2) return;
+
   uint16_t given=(uint16_t)m[n-2] | ((uint16_t)m[n-1]<<8);
   uint16_t calc =crc16_ccitt(m, n-2);
-  if (given!=calc) return;
+  if (given!=calc) {
+    Serial.printf("[PARSE] CRC FAIL len=%u given=0x%04X calc=0x%04X\n",
+                  (unsigned)n, (unsigned)given, (unsigned)calc);
+    return;
+  }
 
   const uint8_t* origin = &m[2];
   uint32_t batch = (uint32_t)m[8] | ((uint32_t)m[9]<<8) | ((uint32_t)m[10]<<16) | ((uint32_t)m[11]<<24);
   uint16_t seq   = (uint16_t)m[12] | ((uint16_t)m[13]<<8);
   uint8_t  typ   = m[1];
+
+  Serial.printf("[PARSE] OK typ=%u src_room=%u batch=%lu seq=%u\n",
+                (unsigned)typ, (unsigned)src_room, (unsigned long)batch, (unsigned)seq);
 
   // Dedup cache
   SeenKey sk{}; memcpy(sk.origin, origin, 6); sk.batch=batch; sk.seq=seq; sk.src_room=src_room;
