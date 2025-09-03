@@ -1,50 +1,112 @@
 /*
-  SMOKE Unified (ESP32-S3) — Receiver/Bridge v1.2
-  - Name-based binding with ASCII-prefix sanitization
-  - Helper commands: 'seen' and 'bindseen <idx> <num>'
-  - Matching order: sanitized NAME bind > MAC bind
-  - Verbose RX shows RAW and SAN names
+  SMOKE Unified (ESP32-S3) — Receiver/Bridge v2.0
+  - One firmware for all receivers (flash-and-go)
+  - UART1 (GPIO16 RX, GPIO17 TX) COBS+CRC input from ICE
+  - Name-based binding (sanitized ASCII prefix) and MAC binding
+  - Strongest-RSSI dedupe per device per scan
+  - ESP-NOW relay with fragmentation/reassembly and ordered chain 1->2->3
+    * Accept frames if SRC_ROOM == myRoom (local) or SRC_ROOM == myRoom-1 (prev)
+    * If tail==off: forward; if tail==on: print compact only
+  - Compact output at END_OF_SCAN:  room.device@rssi
 */
 
 #include <Arduino.h>
 #include <FS.h>
 #include <SPIFFS.h>
+#include <WiFi.h>
+#include <esp_now.h>
+
 #include <map>
 #include <unordered_map>
 #include <vector>
 
-// ====== CONFIG ======
-#define VERBOSE_RX 1
-#define ICE_UART_BAUD  921600
+// ======================= CONFIG =======================
+#define VERBOSE_RX     1          // 1=print per-record RX lines (debug)
+#define UART_BAUD_ICE  921600
 #define ICE_UART_RX    16
 #define ICE_UART_TX    17
 #define ICE_UART_RXBUF 16384
 #define ICE_UART_TXBUF 2048
 
+// ESPNOW payload max on ESP32 is 250 bytes
+#define ESN_PAYLOAD_MAX   250
+#define ESN_FRAG_DATA_MAX 200      // keep headroom for our header
+
+// ============== MESSAGE FORMAT FROM ICE ===============
+// VER(1) TYPE(1) ORIGIN(6) BATCH(4) SEQ(2) COUNT(2) PAYLOAD(...) CRC16(2)
+// TLVs in PAYLOAD: T=1 MAC(6), T=2 RSSI(1,i8), T=3 FLAGS(1), T=4 NAME(n)
 enum MsgType : uint8_t { MT_DATA=0, MT_END=1 };
 
-// ====== STATE / PERSISTED CONFIG ======
-static uint8_t  g_room = 1;
+// ============== CHAIN WRAPPER (ESP-NOW) ===============
+// We forward decoded ICE frames in fragments with this header:
+struct __attribute__((packed)) EsnFrag {
+  uint8_t  magic0;         // 'S'
+  uint8_t  magic1;         // 'M'
+  uint8_t  ver;            // 1
+  uint8_t  src_room;       // room that originated the frame
+  uint8_t  total;          // total fragments for this (origin,batch,seq)
+  uint8_t  index;          // 0..total-1
+  uint8_t  origin[6];      // ORIGIN from ICE header
+  uint32_t batch;          // BATCH from ICE header
+  uint16_t seq;            // SEQ from ICE header
+  uint16_t frag_len;       // length of data[]
+  uint8_t  data[];         // up to ESN_FRAG_DATA_MAX
+};
+
+// ======================= STATE ========================
+static uint8_t  g_room    = 1;     // 1..255
 static bool     g_is_tail = true;
+static bool     g_esn_on  = false;
+static uint8_t  g_channel = 6;
 
 struct MacKey { uint8_t b[6]; bool operator==(const MacKey& o) const { for(int i=0;i<6;i++) if(b[i]!=o.b[i]) return false; return true; } };
 struct MacHash { size_t operator()(const MacKey& k) const { uint32_t h=(k.b[0]<<24)^(k.b[1]<<16)^(k.b[2]<<8)^k.b[3]^(k.b[4]<<4)^k.b[5]; return h; } };
 
-// MAC -> device#
-static std::unordered_map<MacKey, uint16_t, MacHash> mac2dev;
-// device# -> friendly label (optional)
-static std::map<uint16_t, String> devNames;
-// Sanitized Name -> device#  (ordered map so we avoid hashing Arduino String)
-static std::map<String, uint16_t> name2dev;
+// Binds
+static std::unordered_map<MacKey, uint16_t, MacHash> mac2dev; // MAC -> device#
+static std::map<uint16_t, String> devNames;                   // (optional label)
+static std::map<String, uint16_t> name2dev;                   // sanitized Name -> device#
 
 // Per-scan strongest RSSI per device
 static std::unordered_map<uint16_t, int8_t> bestRssi;
 
-// Recent sanitized names (for 'seen' list)
-static const size_t SEEN_MAX = 16;
+// Helper: recent sanitized names for 'seen'/'bindseen'
 static std::vector<String> seenNames;
+static size_t g_seen_max = 128;
 
-// ====== UTILS ======
+// Duplicate frame cache (simple ring)
+struct SeenKey {
+  uint8_t origin[6];
+  uint32_t batch;
+  uint16_t seq;
+  uint8_t  src_room;
+};
+static const size_t SEEN_CACHE_MAX = 256;
+static std::vector<SeenKey> seenCache;
+
+// ESPNOW peer (broadcast)
+static uint8_t ESN_BROADCAST[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+// UART frame buffers (COBS)
+static const size_t FRAME_MAX  = 2000;
+static uint8_t frameBuf[FRAME_MAX]; static size_t frameLen=0;
+static const size_t DECODE_MAX = 2000;
+static uint8_t decodeBuf[DECODE_MAX];
+
+// Reassembly for ESPNOW fragments
+struct ReasmBuf {
+  uint8_t  src_room;
+  uint8_t  origin[6];
+  uint32_t batch;
+  uint16_t seq;
+  uint8_t  total;
+  std::vector<bool> have;
+  std::vector<uint8_t> data;  // concatenated decoded frame bytes
+  uint32_t last_ms;
+};
+static std::vector<ReasmBuf> reasmList;
+
+// ======================= UTILS ========================
 static void macToStr(const uint8_t* m, char out[18]) { sprintf(out,"%02X:%02X:%02X:%02X:%02X:%02X",m[0],m[1],m[2],m[3],m[4],m[5]); }
 static bool parseMac(const String& s, uint8_t out[6]) {
   if (s.length()!=17) return false; int v[6];
@@ -52,32 +114,24 @@ static bool parseMac(const String& s, uint8_t out[6]) {
   for(int i=0;i<6;i++) out[i]=(uint8_t)v[i]; return true;
 }
 static String trimQuotes(String s){ s.trim(); if(s.length()>=2 && ((s.startsWith("\"")&&s.endsWith("\""))||(s.startsWith("'")&&s.endsWith("'")))) return s.substring(1,s.length()-1); return s; }
-
-// Sanitize: keep ASCII 32..126 prefix UNTIL the first non-printable, then stop.
-// Also trim leading/trailing spaces and collapse internal runs of spaces.
+// sanitize to ASCII prefix (stop at first non-printable), trim and collapse spaces
 static String sanitizePrefix(const String& in){
   String out; out.reserve(in.length());
-  for (size_t i=0;i<in.length();++i){
-    uint8_t c=(uint8_t)in[i];
-    if (c<32 || c>126) break; // stop at first weird byte
-    out += (char)c;
-  }
-  // trim + collapse spaces
+  for (size_t i=0;i<in.length();++i){ uint8_t c=(uint8_t)in[i]; if (c<32 || c>126) break; out += (char)c; }
   out.trim();
-  String collapsed; collapsed.reserve(out.length());
-  bool lastSpace=false;
-  for (size_t i=0;i<out.length(); ++i){
-    char c = out[i];
-    if (c==' '||c=='\t'){ if(!lastSpace){ collapsed+=' '; lastSpace=true; } }
-    else { collapsed+=c; lastSpace=false; }
-  }
+  // collapse spaces
+  String collapsed; collapsed.reserve(out.length()); bool lastSpace=false;
+  for (size_t i=0;i<out.length(); ++i){ char c=out[i]; if (c==' '||c=='\t'){ if(!lastSpace){ collapsed+=' '; lastSpace=true; } } else { collapsed+=c; lastSpace=false; } }
   return collapsed;
 }
+static String sanitizeForCsv(const String& s){ String o=s; o.replace(","," "); o.replace("\r"," "); o.replace("\n"," "); return o; }
 
 static uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t crc=0xFFFF){
   while(len--){ crc ^= (uint16_t)(*data++)<<8; for (int i=0;i<8;i++) crc = (crc&0x8000)?((crc<<1)^0x1021):(crc<<1); }
   return crc;
 }
+
+// COBS decode
 static size_t cobs_decode(const uint8_t* in,size_t len,uint8_t* out,size_t outMax){
   if(!len) return 0; const uint8_t* ip=in; const uint8_t* end=in+len; uint8_t* op=out;
   while(ip<end){ uint8_t code=*ip++; if(code==0 || ip+(code-1)>end) return 0;
@@ -86,13 +140,14 @@ static size_t cobs_decode(const uint8_t* in,size_t len,uint8_t* out,size_t outMa
   } return (size_t)(op-out);
 }
 
-// ====== SPIFFS I/O ======
+// =================== PERSISTENCE (SPIFFS) ===================
 static void saveRoom(){ File f=SPIFFS.open("/room.txt", FILE_WRITE, true); if(f){ f.printf("%u\n",(unsigned)g_room); f.close(); } }
 static void loadRoom(){ File f=SPIFFS.open("/room.txt", FILE_READ); if(f){ g_room=(uint8_t)f.readStringUntil('\n').toInt(); f.close(); if(!g_room) g_room=1; } }
 static void saveTail(){ File f=SPIFFS.open("/tail.txt", FILE_WRITE, true); if(f){ f.printf("%d\n", g_is_tail?1:0); f.close(); } }
 static void loadTail(){ File f=SPIFFS.open("/tail.txt", FILE_READ); if(f){ g_is_tail=(f.readStringUntil('\n').toInt()!=0); f.close(); } }
 
-static String sanitizeForCsv(const String& s){ String o=s; o.replace(","," "); o.replace("\r"," "); o.replace("\n"," "); return o; }
+static void saveEsn(){ File f=SPIFFS.open("/esn.txt", FILE_WRITE, true); if(f){ f.printf("%d,%u\n", g_esn_on?1:0, (unsigned)g_channel); f.close(); } }
+static void loadEsn(){ File f=SPIFFS.open("/esn.txt", FILE_READ); if(f){ String line=f.readStringUntil('\n'); f.close(); int comma=line.indexOf(','); if(comma>0){ g_esn_on = line.substring(0,comma).toInt()!=0; uint16_t ch=line.substring(comma+1).toInt(); if(ch>=1 && ch<=13) g_channel=(uint8_t)ch; } } }
 
 static void saveBinds(){ File f=SPIFFS.open("/binds.csv", FILE_WRITE, true); if(!f) return;
   for(auto& kv: mac2dev){ char mac[18]; macToStr(kv.first.b,mac); f.printf("%s,%u\n",mac,(unsigned)kv.second);} f.close();}
@@ -102,13 +157,6 @@ static void loadBinds(){ mac2dev.clear(); File f=SPIFFS.open("/binds.csv", FILE_
     uint8_t m[6]; if(!parseMac(smac,m)) continue; MacKey k; memcpy(k.b,m,6); mac2dev[k]=(uint16_t)sn.toInt(); }
   f.close(); }
 
-static void saveNames(){ File f=SPIFFS.open("/names.csv", FILE_WRITE, true); if(!f) return;
-  for(auto& kv: devNames) f.printf("%u,%s\n",(unsigned)kv.first,sanitizeForCsv(kv.second).c_str()); f.close();}
-static void loadNames(){ devNames.clear(); File f=SPIFFS.open("/names.csv", FILE_READ); if(!f) return;
-  while(f.available()){ String line=f.readStringUntil('\n'); line.trim(); if(!line.length()) continue;
-    int c=line.indexOf(','); if(c<0) continue; uint16_t id=(uint16_t)line.substring(0,c).toInt(); String nm=line.substring(c+1); devNames[id]=nm; }
-  f.close(); }
-
 static void saveNameBinds(){ File f=SPIFFS.open("/namebinds.csv", FILE_WRITE, true); if(!f) return;
   for(auto& kv: name2dev) f.printf("%s,%u\n", sanitizeForCsv(kv.first).c_str(), (unsigned)kv.second); f.close(); }
 static void loadNameBinds(){ name2dev.clear(); File f=SPIFFS.open("/namebinds.csv", FILE_READ); if(!f) return;
@@ -116,30 +164,31 @@ static void loadNameBinds(){ name2dev.clear(); File f=SPIFFS.open("/namebinds.cs
     int c=line.lastIndexOf(','); if(c<0) continue; String nm=line.substring(0,c); uint16_t id=(uint16_t)line.substring(c+1).toInt(); name2dev[nm]=id; }
   f.close(); }
 
-// ====== USB COMMANDS ======
+// =================== USB COMMANDS ===================
 static String inLine;
 static void printHelp(){
   Serial.println(F("Commands:"));
-  Serial.println(F("  setroom <n>                 - set this receiver's room number (1..255)"));
-  Serial.println(F("  tail on|off                 - mark this receiver as tail (USB output)"));
-  Serial.println(F("  bind <MAC> <num>            - map BLE MAC to device number"));
-  Serial.println(F("  bindname <name...> <num>    - map Device Name (sanitized prefix) -> number"));
-  Serial.println(F("  seen                        - list last 16 sanitized names seen"));
-  Serial.println(F("  bindseen <idx> <num>        - bind 'seen' entry idx to number"));
-  Serial.println(F("  name <num> <text...>        - set friendly label"));
-  Serial.println(F("  show room|tail|binds|names|namebinds"));
-  Serial.println(F("  save                        - persist binds & names"));
-  Serial.println(F("Note: names are sanitized to printable ASCII *prefix* before matching."));
+  Serial.println(F("  setroom <n>              ; set this receiver's room number (1..255)"));
+  Serial.println(F("  tail on|off              ; mark this receiver as tail (USB output)"));
+  Serial.println(F("  esn on|off               ; enable/disable ESP-NOW relay"));
+  Serial.println(F("  channel <1..13>          ; set ESP-NOW Wi-Fi channel (all nodes must match)"));
+  Serial.println(F("  bind <MAC> <num>         ; map BLE MAC to device number"));
+  Serial.println(F("  bindname <name...> <num> ; map Device Name (sanitized prefix) to device number"));
+  Serial.println(F("  seen                     ; list recent sanitized names"));
+  Serial.println(F("  bindseen <idx> <num>     ; bind 'seen' entry idx to number"));
+  Serial.println(F("  show room|tail|binds|namebinds|esn|channel"));
+  Serial.println(F("  save                     ; persist binds & names & ESN settings"));
+  Serial.println(F("  help"));
 }
 
 static void handleCommand(const String& s){
   int sp=s.indexOf(' '); String cmd=(sp<0)?s:s.substring(0,sp); String rest=(sp<0)?"":s.substring(sp+1); cmd.toLowerCase();
 
   if(cmd=="help"||cmd=="?"){ printHelp(); }
-
   else if(cmd=="setroom"){ uint16_t n=(uint16_t)rest.toInt(); if(n<1||n>255){ Serial.println(F("ERR: room 1..255")); return; } g_room=(uint8_t)n; saveRoom(); Serial.printf("OK room=%u\n", g_room); }
-
   else if(cmd=="tail"){ String r=rest; r.toLowerCase(); if(r=="on"||r=="1"||r=="true") g_is_tail=true; else if(r=="off"||r=="0"||r=="false") g_is_tail=false; else { Serial.println(F("ERR: tail on|off")); return; } saveTail(); Serial.printf("OK tail=%d\n",(int)g_is_tail); }
+  else if(cmd=="esn"){ String r=rest; r.toLowerCase(); if(r=="on"||r=="1"||r=="true") g_esn_on=true; else if(r=="off"||r=="0"||r=="false") g_esn_on=false; else { Serial.println(F("ERR: esn on|off")); return; } saveEsn(); Serial.printf("OK esn=%d\n",(int)g_esn_on); }
+  else if(cmd=="channel"){ uint16_t ch=(uint16_t)rest.toInt(); if(ch<1||ch>13){ Serial.println(F("ERR: channel 1..13")); return; } g_channel=(uint8_t)ch; saveEsn(); Serial.printf("OK channel=%u\n",(unsigned)g_channel); }
 
   else if(cmd=="bind"){
     int sp2=rest.indexOf(' '); if(sp2<0){ Serial.println(F("ERR: bind <MAC> <num>")); return; }
@@ -153,16 +202,13 @@ static void handleCommand(const String& s){
     int spLast=rest.lastIndexOf(' '); if(spLast<0){ Serial.println(F("ERR: bindname <name...> <num>")); return; }
     String raw = trimQuotes(rest.substring(0, spLast));
     uint16_t id = (uint16_t)rest.substring(spLast+1).toInt(); if(!id){ Serial.println(F("ERR: invalid number")); return; }
-    String san = sanitizePrefix(raw);
-    if(!san.length()){ Serial.println(F("ERR: sanitized name empty")); return; }
+    String san = sanitizePrefix(raw); if(!san.length()){ Serial.println(F("ERR: sanitized name empty")); return; }
     name2dev[san] = id;
     Serial.printf("OK bindname RAW=\"%s\" SAN=\"%s\" -> %u\n", raw.c_str(), san.c_str(), (unsigned)id);
   }
 
   else if(cmd=="seen"){
-    for (size_t i=0; i<seenNames.size(); ++i) {
-      Serial.printf("[%u] %s\n", (unsigned)i, seenNames[i].c_str());
-    }
+    for (size_t i=0; i<seenNames.size(); ++i) Serial.printf("[%u] %s\n", (unsigned)i, seenNames[i].c_str());
   }
 
   else if(cmd=="bindseen"){
@@ -175,23 +221,18 @@ static void handleCommand(const String& s){
     Serial.printf("OK bindseen [%d] \"%s\" -> %u\n", idx, san.c_str(), (unsigned)id);
   }
 
-  else if(cmd=="name"){
-    int sp2=rest.indexOf(' '); if(sp2<0){ Serial.println(F("ERR: name <num> <text...>")); return; }
-    uint16_t id=(uint16_t)rest.substring(0,sp2).toInt(); String nm=rest.substring(sp2+1);
-    devNames[id]=nm; Serial.printf("OK name %u=\"%s\"\n",(unsigned)id,nm.c_str());
-  }
-
-  else if(cmd=="save"){ File f; saveBinds(); saveNames(); saveNameBinds(); Serial.println(F("OK saved")); }
-
   else if(cmd=="show"){
     String r=rest; r.toLowerCase();
     if(r=="room") Serial.printf("room=%u\n", g_room);
     else if(r=="tail") Serial.printf("tail=%d\n", (int)g_is_tail);
+    else if(r=="esn") Serial.printf("esn=%d\n", (int)g_esn_on);
+    else if(r=="channel") Serial.printf("channel=%u\n", (unsigned)g_channel);
     else if(r=="binds"){ for(auto& kv: mac2dev){ char mac[18]; macToStr(kv.first.b,mac); Serial.printf("%s -> %u\n", mac, (unsigned)kv.second);} }
-    else if(r=="names"){ for(auto& kv: devNames){ Serial.printf("%u,%s\n", (unsigned)kv.first, kv.second.c_str()); } }
     else if(r=="namebinds"){ for(auto& kv: name2dev){ Serial.printf("\"%s\" -> %u\n", kv.first.c_str(), (unsigned)kv.second); } }
-    else Serial.println(F("ERR: show room|tail|binds|names|namebinds"));
+    else Serial.println(F("ERR: show room|tail|binds|namebinds|esn|channel"));
   }
+
+  else if(cmd=="save"){ saveBinds(); saveNameBinds(); saveEsn(); Serial.println(F("OK saved")); }
 
   else if(cmd.length()){ Serial.println(F("ERR: unknown. Type 'help'.")); }
 }
@@ -204,121 +245,284 @@ static void pollUsb(){
   }
 }
 
-// ====== UART1 / COBS ======
-static const size_t FRAME_MAX  = 2000;
-static uint8_t frameBuf[FRAME_MAX]; static size_t frameLen=0;
-static const size_t DECODE_MAX = 2000;
-static uint8_t decodeBuf[DECODE_MAX];
+// =================== ESPNOW LAYER ===================
+static bool esnInited = false;
 
-static void processDecodedMessage(const uint8_t* m, size_t n);
+static void esn_teardown(){
+  if (!esnInited) return;
+  esp_now_deinit();
+  WiFi.mode(WIFI_OFF);
+  esnInited = false;
+}
 
-static void pollICE(){
-  while(Serial1.available()){
-    uint8_t b=(uint8_t)Serial1.read();
-    if(b==0x00){
-      if(frameLen>0){
-        size_t dec=cobs_decode(frameBuf, frameLen, decodeBuf, DECODE_MAX);
-        if(dec>0) processDecodedMessage(decodeBuf, dec);
-        frameLen=0;
-      }
-    } else {
-      if(frameLen<FRAME_MAX) frameBuf[frameLen++]=b; else frameLen=0;
+static bool esn_setup(){
+  if (!g_esn_on) { esn_teardown(); return false; }
+  WiFi.mode(WIFI_STA);
+  // lock channel
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(g_channel, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init failed"); return false;
+  }
+  esnInited = true;
+
+  esp_now_peer_info_t peer{};
+  memcpy(peer.peer_addr, ESN_BROADCAST, 6);
+  peer.channel = g_channel;
+  peer.encrypt = false;
+  esp_now_add_peer(&peer);
+
+  // callbacks
+  esp_now_register_recv_cb([](const uint8_t* mac, const uint8_t* data, int len){
+    if (len < (int)sizeof(EsnFrag)) return;
+    const EsnFrag* h = (const EsnFrag*)data;
+    if (h->magic0!='S' || h->magic1!='M' || h->ver!=1) return;
+    if (h->frag_len + (int)sizeof(EsnFrag) > len) return;
+
+    // Accept rule: only src_room == myRoom-1 or == myRoom (we may hear our own rebroadcast; dedupe later)
+    if (!(h->src_room == g_room || h->src_room == (uint8_t)(g_room-1))) return;
+
+    // Find or create reassembly slot
+    uint32_t now = millis();
+    int slot = -1;
+    for (size_t i=0;i<reasmList.size();++i){
+      ReasmBuf& rb = reasmList[i];
+      if (rb.src_room==h->src_room && rb.batch==h->batch && rb.seq==h->seq && memcmp(rb.origin,h->origin,6)==0){ slot=(int)i; break; }
+      // GC old
+      if (now - rb.last_ms > 3000) { reasmList.erase(reasmList.begin()+i); --i; }
     }
+    if (slot<0){
+      ReasmBuf rb{};
+      rb.src_room = h->src_room;
+      memcpy(rb.origin, h->origin, 6);
+      rb.batch = h->batch; rb.seq = h->seq;
+      rb.total = h->total;
+      rb.have.assign(h->total, false);
+      rb.data.clear();
+      rb.data.reserve(h->total * ESN_FRAG_DATA_MAX);
+      rb.last_ms = now;
+      reasmList.push_back(rb);
+      slot = (int)reasmList.size()-1;
+    }
+    ReasmBuf& rb = reasmList[slot];
+    if (h->index >= rb.total) return;
+    if (!rb.have[h->index]){
+      rb.have[h->index] = true;
+      rb.data.insert(rb.data.end(), h->data, h->data + h->frag_len);
+      rb.last_ms = now;
+    }
+    // Check complete
+    bool complete = true;
+    for (bool b : rb.have) if (!b) { complete = false; break; }
+    if (complete){
+      // Dedup cache (origin,batch,seq,src_room)
+      SeenKey sk{}; memcpy(sk.origin, rb.origin, 6); sk.batch=rb.batch; sk.seq=rb.seq; sk.src_room=rb.src_room;
+      bool duplicate=false;
+      for (auto &k : seenCache){
+        if (k.src_room==sk.src_room && k.batch==sk.batch && k.seq==sk.seq && memcmp(k.origin,sk.origin,6)==0){ duplicate=true; break; }
+      }
+      if (!duplicate){
+        if (seenCache.size() >= SEEN_CACHE_MAX) seenCache.erase(seenCache.begin());
+        seenCache.push_back(sk);
+        // Process decoded message (rb.data)
+        extern void processDecodedMessage(const uint8_t*, size_t, uint8_t /*src_room*/, bool /*from_esn*/);
+        processDecodedMessage(rb.data.data(), rb.data.size(), rb.src_room, true);
+      }
+      reasmList.erase(reasmList.begin()+slot);
+    }
+  });
+
+  esp_now_register_send_cb(nullptr);
+  return true;
+}
+
+static void esn_send_frag(const EsnFrag* hdr, size_t bytes){
+  if (!esnInited) return;
+  esp_now_send(ESN_BROADCAST, (const uint8_t*)hdr, bytes);
+}
+
+static void forward_upstream(uint8_t src_room, const uint8_t* decoded, size_t n, const uint8_t* origin, uint32_t batch, uint16_t seq){
+  if (!g_esn_on || g_is_tail) return;
+  // Only forward if I'm the originating room, or I'm the next hop (I accept both by accept rule; here we ensure we forward once)
+  if (!(src_room == g_room || src_room == (uint8_t)(g_room-1))) return;
+
+  // Fragment and send
+  uint8_t total = (n + ESN_FRAG_DATA_MAX - 1) / ESN_FRAG_DATA_MAX;
+  if (total == 0) total = 1;
+  for (uint8_t idx=0; idx<total; ++idx){
+    size_t off = idx * ESN_FRAG_DATA_MAX;
+    size_t take = min(ESN_FRAG_DATA_MAX, n - off);
+
+    uint8_t buf[sizeof(EsnFrag) + ESN_FRAG_DATA_MAX];
+    EsnFrag* h = (EsnFrag*)buf;
+    h->magic0='S'; h->magic1='M'; h->ver=1;
+    h->src_room = src_room;
+    h->total = total;
+    h->index = idx;
+    memcpy(h->origin, origin, 6);
+    h->batch = batch;
+    h->seq   = seq;
+    h->frag_len = (uint16_t)take;
+    memcpy(h->data, decoded + off, take);
+
+    size_t bytes = sizeof(EsnFrag) + take;
+    esn_send_frag(h, bytes);
   }
 }
 
-// ====== PARSER ======
+// =================== PARSER / PIPELINE ===================
 static void addSeen(const String& san){
   if (!san.length()) return;
-  // de-dup; move to front
   for (size_t i=0;i<seenNames.size();++i){
     if (seenNames[i] == san){
-      // move to front
       if (i!=0){ seenNames.erase(seenNames.begin()+i); seenNames.insert(seenNames.begin(), san); }
       return;
     }
   }
-  // insert at front
   seenNames.insert(seenNames.begin(), san);
-  if (seenNames.size() > SEEN_MAX) seenNames.pop_back();
+  if (seenNames.size() > g_seen_max) seenNames.pop_back();
 }
 
 static void endOfScanFlush(){
-  for(auto &kv: bestRssi){
+  for (auto &kv : bestRssi){
     Serial.printf("%u.%u@%d\n", (unsigned)g_room, (unsigned)kv.first, (int)kv.second);
   }
   bestRssi.clear();
   Serial.println("--- END OF SCAN ---");
 }
 
-static void processDecodedMessage(const uint8_t* m, size_t n){
-  if(n < 1+1+6+4+2+2+2) return;
-  uint16_t given=(uint16_t)m[n-2]|((uint16_t)m[n-1]<<8);
-  uint16_t calc =crc16_ccitt(m,n-2);
-  if(given!=calc) return;
+// Process a single **decoded** ICE message (from UART or ESPNOW)
+void processDecodedMessage(const uint8_t* m, size_t n, uint8_t src_room, bool from_esn){
+  if (n < 1+1+6+4+2+2+2) return;
+  // CRC
+  uint16_t given=(uint16_t)m[n-2] | ((uint16_t)m[n-1]<<8);
+  uint16_t calc =crc16_ccitt(m, n-2);
+  if (given!=calc) return;
 
-  uint8_t typ=m[1];
-  if(typ==MT_END){ endOfScanFlush(); return; }
+  const uint8_t* origin = &m[2];
+  uint32_t batch = (uint32_t)m[8] | ((uint32_t)m[9]<<8) | ((uint32_t)m[10]<<16) | ((uint32_t)m[11]<<24);
+  uint16_t seq   = (uint16_t)m[12] | ((uint16_t)m[13]<<8);
+  uint8_t  typ   = m[1];
 
-  uint16_t count=(uint16_t)m[14]|((uint16_t)m[15]<<8);
-  size_t p=1+1+6+4+2+2, end=n-2;
-
-  for(uint16_t i=0;i<count && p+2<=end;++i){
-    // MAC
-    if (p+2>end) break; uint8_t T=m[p++], L=m[p++]; if(!(T==1 && L==6) || p+6>end) break;
-    MacKey mk; memcpy(mk.b,&m[p],6); p+=6;
-    // RSSI
-    if (p+2>end) break; T=m[p++]; L=m[p++]; if(!(T==2 && L==1) || p+1>end) break;
-    int8_t rssi=(int8_t)m[p++];
-    // FLAGS
-    if (p+2>end) break; T=m[p++]; L=m[p++]; if(!(T==3 && L==1) || p+1>end) break; p++;
-    // NAME
-    String nameRaw, nameSan;
-    if (p+2<=end && m[p]==4){ T=m[p++]; L=m[p++]; if(p+L<=end){ nameRaw = String((const char*)&m[p], L); p+=L; } }
-    if (nameRaw.length()) nameSan = sanitizePrefix(nameRaw), addSeen(nameSan);
-
-    // choose device number: NAME (sanitized) then MAC
-    uint16_t devNum = 0xFFFF;
-    if (nameSan.length()){
-      auto itn = name2dev.find(nameSan);
-      if (itn!=name2dev.end()) devNum = itn->second;
+  // Dedup cache
+  SeenKey sk{}; memcpy(sk.origin, origin, 6); sk.batch=batch; sk.seq=seq; sk.src_room=src_room;
+  for (auto &k : seenCache){
+    if (k.src_room==sk.src_room && k.batch==sk.batch && k.seq==sk.seq && memcmp(k.origin,sk.origin,6)==0) {
+      // already processed
+      goto maybe_forward;
     }
-    if (devNum==0xFFFF){
-      auto itm = mac2dev.find(mk);
-      if (itm!=mac2dev.end()) devNum = itm->second;
-    }
+  }
+  if (seenCache.size() >= SEEN_CACHE_MAX) seenCache.erase(seenCache.begin());
+  seenCache.push_back(sk);
+
+  if (typ == MT_END){
+    endOfScanFlush();
+  } else {
+    // DATA
+    uint16_t count = (uint16_t)m[14] | ((uint16_t)m[15]<<8);
+    size_t p = 1+1+6+4+2+2;
+    size_t end = n-2;
+
+    for (uint16_t i=0; i<count && p+2<=end; ++i){
+      // T1 MAC
+      if (p+2>end) break; uint8_t T=m[p++], L=m[p++]; if(!(T==1 && L==6) || p+6>end) break;
+      MacKey mk; memcpy(mk.b, &m[p], 6); p+=6;
+      // T2 RSSI
+      if (p+2>end) break; T=m[p++]; L=m[p++]; if(!(T==2 && L==1) || p+1>end) break;
+      int8_t rssi=(int8_t)m[p++];
+      // T3 FLAGS
+      if (p+2>end) break; T=m[p++]; L=m[p++]; if(!(T==3 && L==1) || p+1>end) break; p++;
+      // T4 NAME (optional)
+      String nameRaw, nameSan;
+      if (p+2<=end && m[p]==4){ T=m[p++]; L=m[p++]; if(p+L<=end){ nameRaw = String((const char*)&m[p], L); p+=L; } }
+      if (nameRaw.length()) { nameSan = sanitizePrefix(nameRaw); addSeen(nameSan); }
+
+      // choose device number
+      uint16_t devNum = 0xFFFF;
+      if (nameSan.length()){
+        auto itn = name2dev.find(nameSan);
+        if (itn!=name2dev.end()) devNum = itn->second;
+      }
+      if (devNum==0xFFFF){
+        auto itm = mac2dev.find(mk);
+        if (itm!=mac2dev.end()) devNum = itm->second;
+      }
 
 #if VERBOSE_RX
-    {
-      char macStr[18]; macToStr(mk.b,macStr);
-      Serial.print("RX "); Serial.print(macStr);
-      Serial.print(" RSSI="); Serial.print((int)rssi);
-      if (nameRaw.length()){
-        Serial.print(" NameRAW=\""); Serial.print(nameRaw); Serial.print("\"");
-        Serial.print(" SAN=\""); Serial.print(nameSan); Serial.print("\"");
+      {
+        char macStr[18]; macToStr(mk.b,macStr);
+        Serial.print("RX "); Serial.print(macStr);
+        Serial.print(" RSSI="); Serial.print((int)rssi);
+        if (nameRaw.length()){
+          Serial.print(" NameRAW=\""); Serial.print(nameRaw); Serial.print("\"");
+          if (nameSan.length()){ Serial.print(" SAN=\""); Serial.print(nameSan); Serial.print("\""); }
+        }
+        if (devNum!=0xFFFF){ Serial.print(" -> dev "); Serial.println(devNum); }
+        else               { Serial.println(" -> (no bind)"); }
       }
-      if (devNum!=0xFFFF){ Serial.print(" -> dev "); Serial.println(devNum); }
-      else               { Serial.println(" -> (no bind)"); }
-    }
 #endif
 
-    if (devNum!=0xFFFF){
-      auto br=bestRssi.find(devNum);
-      if (br==bestRssi.end() || rssi>br->second) bestRssi[devNum]=rssi;
+      if (devNum!=0xFFFF){
+        auto br=bestRssi.find(devNum);
+        if (br==bestRssi.end() || rssi>br->second) bestRssi[devNum]=rssi;
+      }
+    }
+  }
+
+maybe_forward:
+  // Forward rule: only if ESPNOW on, I'm not tail, and (src_room==myRoom or myRoom-1)
+  if (g_esn_on && !g_is_tail && (src_room == g_room || src_room == (uint8_t)(g_room-1))) {
+    // forward the same decoded frame upstream unchanged, keeping src_room
+    forward_upstream(src_room, m, n, origin, batch, seq);
+  }
+}
+
+// =================== UART1 (ICE) ===================
+static void pollICE(){
+  while(Serial1.available()){
+    uint8_t b=(uint8_t)Serial1.read();
+    if (b==0x00){
+      if (frameLen>0){
+        size_t dec=cobs_decode(frameBuf, frameLen, decodeBuf, DECODE_MAX);
+        if (dec>0) {
+          // Local frames originate here -> src_room = my room
+          processDecodedMessage(decodeBuf, dec, g_room, false);
+        }
+        frameLen=0;
+      }
+    } else {
+      if (frameLen<FRAME_MAX) frameBuf[frameLen++]=b; else frameLen=0;
     }
   }
 }
 
-// ====== SETUP / LOOP ======
+// =================== SETUP / LOOP ===================
 void setup(){
   Serial.begin(115200); delay(50);
-  if(!SPIFFS.begin(true)) Serial.println("SPIFFS mount failed");
-  else { loadRoom(); loadTail(); loadBinds(); loadNames(); loadNameBinds(); }
-  Serial.printf("SMOKE ready. room=%u tail=%d\n",(unsigned)g_room,(int)g_is_tail);
+
+  if (!SPIFFS.begin(true)) Serial.println("SPIFFS mount failed");
+  loadRoom(); loadTail(); loadEsn(); loadBinds(); loadNameBinds();
+
+  Serial.printf("SMOKE ready. room=%u tail=%d esn=%d ch=%u\n",
+                (unsigned)g_room, (int)g_is_tail, (int)g_esn_on, (unsigned)g_channel);
   printHelp();
 
   Serial1.setRxBufferSize(ICE_UART_RXBUF);
   Serial1.setTxBufferSize(ICE_UART_TXBUF);
-  Serial1.begin(ICE_UART_BAUD, SERIAL_8N1, ICE_UART_RX, ICE_UART_TX);
+  Serial1.begin(UART_BAUD_ICE, SERIAL_8N1, ICE_UART_RX, ICE_UART_TX);
+
+  if (g_esn_on) esn_setup();
 }
-void loop(){ pollICE(); pollUsb(); }
+
+void loop(){
+  pollICE();
+  pollUsb();
+  // Re-init ESPNOW if config changed at runtime
+  static bool last_esn=false; static uint8_t last_ch=0;
+  if (last_esn != g_esn_on || last_ch != g_channel){
+    last_esn = g_esn_on; last_ch = g_channel;
+    esn_teardown(); esn_setup();
+  }
+}
