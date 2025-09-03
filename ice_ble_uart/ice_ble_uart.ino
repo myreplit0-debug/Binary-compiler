@@ -1,13 +1,13 @@
 /*
-  SMOKE Unified (ESP32-S3) — Receiver/Bridge v2.0 + ESN_DEBUG
+  SMOKE Unified (ESP32-S3) — Receiver/Bridge v2.1 (room-aware)
   - One firmware for all receivers (flash-and-go)
   - UART1 (GPIO16 RX, GPIO17 TX) COBS+CRC input from ICE
   - Name-based binding (sanitized ASCII prefix) and MAC binding
-  - Strongest-RSSI dedupe per device per scan
-  - ESP-NOW relay with fragmentation/reassembly and ordered chain 1->2->3
+  - Strongest-RSSI dedupe per device **per room** per scan
+  - ESP-NOW relay with fragmentation/reassembly, chain ordering 1->2->3...
     * Accept frames if SRC_ROOM == myRoom (local) or SRC_ROOM == myRoom-1 (prev)
-    * If tail==off: forward; if tail==on: print compact only
-  - Compact output at END_OF_SCAN:  room.device@rssi
+    * If tail==off: forward upstream; if tail==on: print compact summary
+  - Compact output at END_OF_SCAN:  room.device@rssi  (room comes from src_room)
 */
 
 #include <Arduino.h>
@@ -68,7 +68,16 @@ static std::unordered_map<MacKey, uint16_t, MacHash> mac2dev; // MAC -> device#
 static std::map<uint16_t, String> devNames;
 static std::map<String, uint16_t> name2dev;                   // sanitized Name -> device#
 
-static std::unordered_map<uint16_t, int8_t> bestRssi;         // per-scan strongest RSSI
+// --------- room-aware "best RSSI this scan" ---------
+struct RoomDevKey {
+  uint8_t  room;
+  uint16_t dev;
+  bool operator==(const RoomDevKey& o) const { return room==o.room && dev==o.dev; }
+};
+struct RoomDevHash {
+  size_t operator()(const RoomDevKey& k) const { return ((size_t)k.room << 16) ^ (size_t)k.dev; }
+};
+static std::unordered_map<RoomDevKey, int8_t, RoomDevHash> bestRssi;
 
 static std::vector<String> seenNames;                         // recent sanitized names
 static size_t g_seen_max = 128;
@@ -113,10 +122,12 @@ static bool parseMac(const String& s, uint8_t out[6]) {
   for(int i=0;i<6;i++) out[i]=(uint8_t)v[i]; return true;
 }
 static String trimQuotes(String s){ s.trim(); if(s.length()>=2 && ((s.startsWith("\"")&&s.endsWith("\""))||(s.startsWith("'")&&s.endsWith("'")))) return s.substring(1,s.length()-1); return s; }
+// sanitize to ASCII prefix (stop at first non-printable), trim and collapse spaces
 static String sanitizePrefix(const String& in){
   String out; out.reserve(in.length());
   for (size_t i=0;i<in.length();++i){ uint8_t c=(uint8_t)in[i]; if (c<32 || c>126) break; out += (char)c; }
   out.trim();
+  // collapse spaces
   String collapsed; collapsed.reserve(out.length()); bool lastSpace=false;
   for (size_t i=0;i<out.length(); ++i){ char c=out[i]; if (c==' '||c=='\t'){ if(!lastSpace){ collapsed+=' '; lastSpace=true; } } else { collapsed+=c; lastSpace=false; } }
   return collapsed;
@@ -274,8 +285,9 @@ static bool esn_setup(){
   peer.encrypt = false;
   esp_now_add_peer(&peer);
 
-  // NEW callback signature (Arduino-ESP32 3.x)
+  // Arduino-ESP32 3.x signature
   esp_now_register_recv_cb([](const esp_now_recv_info_t* info, const uint8_t* data, int len){
+    (void)info;
     if (len < (int)sizeof(EsnFrag)) return;
     const EsnFrag* h = (const EsnFrag*)data;
     if (h->magic0!='S' || h->magic1!='M' || h->ver!=1) return;
@@ -403,11 +415,19 @@ static void addSeen(const String& san){
   if (seenNames.size() > g_seen_max) seenNames.pop_back();
 }
 
-static void endOfScanFlush(){
+static void endOfScanFlush(uint8_t flush_room){
+  // print only entries for the room that triggered END_OF_SCAN
+  std::vector<RoomDevKey> toErase;
   for (auto &kv : bestRssi){
-    Serial.printf("%u.%u@%d\n", (unsigned)g_room, (unsigned)kv.first, (int)kv.second);
+    if (kv.first.room == flush_room){
+      Serial.printf("%u.%u@%d\n",
+                    (unsigned)kv.first.room,
+                    (unsigned)kv.first.dev,
+                    (int)kv.second);
+      toErase.push_back(kv.first);
+    }
   }
-  bestRssi.clear();
+  for (auto &k : toErase) bestRssi.erase(k);
   Serial.println("--- END OF SCAN ---");
 }
 
@@ -434,7 +454,7 @@ void processDecodedMessage(const uint8_t* m, size_t n, uint8_t src_room, bool /*
   seenCache.push_back(sk);
 
   if (typ == MT_END){
-    endOfScanFlush();
+    endOfScanFlush(src_room);
   } else {
     uint16_t count = (uint16_t)m[14] | ((uint16_t)m[15]<<8);
     size_t p = 1+1+6+4+2+2;
@@ -480,8 +500,9 @@ void processDecodedMessage(const uint8_t* m, size_t n, uint8_t src_room, bool /*
 #endif
 
       if (devNum!=0xFFFF){
-        auto br=bestRssi.find(devNum);
-        if (br==bestRssi.end() || rssi>br->second) bestRssi[devNum]=rssi;
+        RoomDevKey k{ src_room, devNum };
+        auto it = bestRssi.find(k);
+        if (it==bestRssi.end() || rssi > it->second) bestRssi[k] = rssi;
       }
     }
   }
