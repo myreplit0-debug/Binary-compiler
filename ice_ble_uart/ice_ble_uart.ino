@@ -246,6 +246,9 @@ static void pollUsb(){
   }
 }
 
+// ---------- forward declaration so the ESP-NOW lambda can call it ----------
+void processDecodedMessage(const uint8_t* m, size_t n, uint8_t src_room, bool from_esn);
+
 // =================== ESPNOW LAYER ===================
 static bool esnInited = false;
 
@@ -275,14 +278,14 @@ static bool esn_setup(){
   peer.encrypt = false;
   esp_now_add_peer(&peer);
 
-  // callbacks
-  esp_now_register_recv_cb([](const uint8_t* mac, const uint8_t* data, int len){
+  // ---- NEW callback signature for Arduino-ESP32 3.x ----
+  esp_now_register_recv_cb([](const esp_now_recv_info_t* info, const uint8_t* data, int len){
     if (len < (int)sizeof(EsnFrag)) return;
     const EsnFrag* h = (const EsnFrag*)data;
     if (h->magic0!='S' || h->magic1!='M' || h->ver!=1) return;
-    if (h->frag_len + (int)sizeof(EsnFrag) > len) return;
+    if ((int)sizeof(EsnFrag) + (int)h->frag_len > len) return;
 
-    // Accept rule: only src_room == myRoom-1 or == myRoom (we may hear our own rebroadcast; dedupe later)
+    // Accept rule: only src_room == myRoom-1 or == myRoom
     if (!(h->src_room == g_room || h->src_room == (uint8_t)(g_room-1))) return;
 
     // Find or create reassembly slot
@@ -328,7 +331,6 @@ static bool esn_setup(){
         if (seenCache.size() >= SEEN_CACHE_MAX) seenCache.erase(seenCache.begin());
         seenCache.push_back(sk);
         // Process decoded message (rb.data)
-        extern void processDecodedMessage(const uint8_t*, size_t, uint8_t /*src_room*/, bool /*from_esn*/);
         processDecodedMessage(rb.data.data(), rb.data.size(), rb.src_room, true);
       }
       reasmList.erase(reasmList.begin()+slot);
@@ -402,7 +404,7 @@ static void endOfScanFlush(){
 }
 
 // Process a single **decoded** ICE message (from UART or ESPNOW)
-void processDecodedMessage(const uint8_t* m, size_t n, uint8_t src_room, bool from_esn){
+void processDecodedMessage(const uint8_t* m, size_t n, uint8_t src_room, bool /*from_esn*/){
   if (n < 1+1+6+4+2+2+2) return;
   // CRC
   uint16_t given=(uint16_t)m[n-2] | ((uint16_t)m[n-1]<<8);
@@ -482,7 +484,6 @@ void processDecodedMessage(const uint8_t* m, size_t n, uint8_t src_room, bool fr
 maybe_forward:
   // Forward rule: only if ESPNOW on, I'm not tail, and (src_room==myRoom or myRoom-1)
   if (g_esn_on && !g_is_tail && (src_room == g_room || src_room == (uint8_t)(g_room-1))) {
-    // forward the same decoded frame upstream unchanged, keeping src_room
     forward_upstream(src_room, m, n, origin, batch, seq);
   }
 }
