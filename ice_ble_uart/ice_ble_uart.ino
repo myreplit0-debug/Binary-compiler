@@ -1,4 +1,4 @@
-/*  SMOKE Unified (ESP32-S3) — Receiver/Bridge v2.1 (room-aware)  */
+/*  SMOKE Unified (ESP32-S3) — Receiver/Bridge v2.1 (room-aware, AGG/FLUSH debug)  */
 
 #include <Arduino.h>
 #include <FS.h>
@@ -63,7 +63,7 @@ struct ReasmBuf {
   uint32_t batch;
   uint16_t seq;
   std::vector<bool> have;
-  std::vector<uint16_t> frag_len;          // *** DEBUG: track length per chunk
+  std::vector<uint16_t> frag_len;          // track length per chunk
   std::vector<uint8_t> data;               // full-size buffer
   uint32_t last_ms;
 };
@@ -141,6 +141,7 @@ static bool esn_setup(){
   esnInited=true;
   esp_now_peer_info_t peer{}; memcpy(peer.peer_addr, ESN_BROADCAST, 6); peer.channel=g_channel; peer.encrypt=false; esp_now_add_peer(&peer);
 
+  // Arduino-ESP32 3.x callback signature
   esp_now_register_recv_cb([](const esp_now_recv_info_t* info, const uint8_t* data, int len){
     (void)info;
     if(len<(int)sizeof(EsnFrag)) return;
@@ -168,7 +169,7 @@ static bool esn_setup(){
       rb.batch=h->batch; rb.seq=h->seq; rb.total=h->total;
       rb.have.assign(h->total,false);
       rb.frag_len.assign(h->total,0);
-      rb.data.assign((size_t)h->total * (size_t)ESN_FRAG_DATA_MAX, 0);   // *** place-by-index buffer
+      rb.data.assign((size_t)h->total * (size_t)ESN_FRAG_DATA_MAX, 0);
       rb.last_ms=now;
       reasmList.push_back(rb);
       slot=(int)reasmList.size()-1;
@@ -179,13 +180,12 @@ static bool esn_setup(){
       rb.have[h->index]=true;
       rb.frag_len[h->index]=h->frag_len;
       size_t off=(size_t)h->index*(size_t)ESN_FRAG_DATA_MAX;
-      memcpy(&rb.data[off], h->data, h->frag_len);              // *** copy at offset
+      memcpy(&rb.data[off], h->data, h->frag_len);
       rb.last_ms=now;
     }
     bool complete=true;
     for(bool b:rb.have) if(!b){ complete=false; break; }
     if(complete){
-      // compute true length from per-frag lengths
       size_t total_len=0;
       for(uint8_t i=0;i<rb.total;i++) total_len += rb.frag_len[i];
       std::vector<uint8_t> msg; msg.reserve(total_len);
@@ -239,14 +239,22 @@ static void forward_upstream(uint8_t src_room, const uint8_t* decoded, size_t n,
 static void addSeen(const String& san){ if(!san.length()) return; for(size_t i=0;i<seenNames.size();++i){ if(seenNames[i]==san){ if(i!=0){ seenNames.erase(seenNames.begin()+i); seenNames.insert(seenNames.begin(),san);} return; } } seenNames.insert(seenNames.begin(),san); if(seenNames.size()>g_seen_max) seenNames.pop_back(); }
 
 static void endOfScanFlush(uint8_t flush_room){
-  std::vector<RoomDevKey> erase;
-  for(auto& kv:bestRssi){
-    if(kv.first.room==flush_room){
-      Serial.printf("%u.%u@%d\n",(unsigned)kv.first.room,(unsigned)kv.first.dev,(int)kv.second);
-      erase.push_back(kv.first);
+  uint32_t n=0;
+  for (auto &kv : bestRssi){
+    if (kv.first.room == flush_room){
+      ++n;
+      Serial.printf("%u.%u@%d\n",
+                    (unsigned)kv.first.room,
+                    (unsigned)kv.first.dev,
+                    (int)kv.second);
     }
   }
-  for(auto& k:erase) bestRssi.erase(k);
+  // erase only what we printed
+  std::vector<RoomDevKey> toErase;
+  for (auto &kv : bestRssi) if (kv.first.room==flush_room) toErase.push_back(kv.first);
+  for (auto &k : toErase) bestRssi.erase(k);
+
+  Serial.printf("[FLUSH] room=%u entries=%lu\n", (unsigned)flush_room, (unsigned long)n);
   Serial.println("--- END OF SCAN ---");
 }
 
@@ -273,7 +281,7 @@ void processDecodedMessage(const uint8_t* m, size_t n, uint8_t src_room, bool /*
     endOfScanFlush(src_room);
   } else {
     uint16_t count=(uint16_t)m[14] | ((uint16_t)m[15]<<8);
-    Serial.printf("[PARSE] count=%u\n",(unsigned)count);                      // *** DEBUG
+    Serial.printf("[PARSE] count=%u\n",(unsigned)count);
     size_t p=1+1+6+4+2+2; size_t end=n-2;
 
     for(uint16_t i=0; i<count && p+2<=end; ++i){
@@ -300,15 +308,23 @@ void processDecodedMessage(const uint8_t* m, size_t n, uint8_t src_room, bool /*
       if(nameSan.length()){ auto itn=name2dev.find(nameSan); if(itn!=name2dev.end()) devNum=itn->second; }
       if(devNum==0xFFFF){ auto itm=mac2dev.find(mk); if(itm!=mac2dev.end()) devNum=itm->second; }
 
-      char macStr[18]; macToStr(mk.b,macStr);
-      Serial.printf("[REC] mac=%s rssi=%d SAN=\"%s\" -> %s\n",
-                    macStr,(int)rssi, nameSan.c_str(),
-                    (devNum!=0xFFFF? String("dev "+String(devNum)).c_str() : "(no bind)"));
+#if VERBOSE_RX
+      {
+        char macStr[18]; macToStr(mk.b,macStr);
+        Serial.printf("[REC] mac=%s rssi=%d SAN=\"%s\" -> %s\n",
+                      macStr,(int)rssi, nameSan.c_str(),
+                      (devNum!=0xFFFF? String("dev "+String(devNum)).c_str() : "(no bind)"));
+      }
+#endif
 
       if(devNum!=0xFFFF){
         RoomDevKey k{ src_room, devNum };
         auto it=bestRssi.find(k);
-        if(it==bestRssi.end() || rssi>it->second) bestRssi[k]=rssi;
+        if(it==bestRssi.end() || rssi>it->second){
+          bestRssi[k]=rssi;
+          Serial.printf("[AGG] room=%u dev=%u rssi=%d\n",
+                        (unsigned)k.room, (unsigned)k.dev, (int)bestRssi[k]);
+        }
       }
     }
   }
@@ -350,5 +366,8 @@ void loop(){
   pollICE();
   pollUsb();
   static bool last_esn=false; static uint8_t last_ch=0;
-  if(last_esn!=g_esn_on || last_ch!=g_channel){ last_esn=g_esn_on; last_ch=g_channel; esn_teardown(); esn_setup(); }
+  if(last_esn!=g_esn_on || last_ch!=g_channel){
+    last_esn=g_esn_on; last_ch=g_channel;
+    esn_teardown(); esn_setup();
+  }
 }
