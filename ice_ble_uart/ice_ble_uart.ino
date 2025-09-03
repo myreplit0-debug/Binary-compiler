@@ -1,37 +1,34 @@
 /*
-  SMOKE Unified (ESP32-S3) — Receiver/Bridge v0 (with verbose RX debug)
+  SMOKE Unified (ESP32-S3) — Receiver/Bridge v1 (Name binding + Verbose RX)
   - Single firmware for all receivers (flash-and-go)
   - Input: COBS-framed ICE messages on UART1 (RX=16, TX=17)
   - Output: compact "room.device@rssi" lines on USB at END_OF_SCAN
   - Config over USB + SPIFFS persistence
-  - Verbose RX debug: prints every received MAC/RSSI and whether it matched a bind
-
-  Next step (same firmware; config-driven): ESP-NOW hop/forwarding.
+  - Matching priority: bindname (Device Name) > bind (MAC)
 */
 
 #include <Arduino.h>
 #include <FS.h>
 #include <SPIFFS.h>
+#include <map>
+#include <unordered_map>
 
 // ====== CONFIG ======
 #define VERBOSE_RX 1                 // set 0 later to quiet logs
 #define ICE_UART_BAUD  921600
 #define ICE_UART_RX    16
 #define ICE_UART_TX    17
-#define ICE_UART_RXBUF 8192
+#define ICE_UART_RXBUF 16384         // larger to be safe
 #define ICE_UART_TXBUF 2048
 
 // Message format from ICE:
 // VER(1) TYPE(1) ORIGIN(6) BATCH(4) SEQ(2) COUNT(2) PAYLOAD(...) CRC16(2)
-// Device TLVs in PAYLOAD: T=1 MAC(6), T=2 RSSI(1,i8), T=3 FLAGS(1), T=4 NAME(n)
+// Device TLVs: T=1 MAC(6), T=2 RSSI(1,i8), T=3 FLAGS(1), T=4 NAME(n)
 enum MsgType : uint8_t { MT_DATA=0, MT_END=1 };
 
 // ====== STATE / PERSISTED CONFIG ======
 static uint8_t  g_room = 1;   // 1..255
 static bool     g_is_tail = true;
-
-#include <map>
-#include <unordered_map>
 
 struct MacKey {
   uint8_t b[6];
@@ -45,8 +42,15 @@ struct MacHash {
     return h;
   }
 };
-static std::unordered_map<MacKey, uint16_t, MacHash> mac2dev; // MAC -> device#
-static std::map<uint16_t, String> devNames;                    // device# -> name
+
+// MAC -> device#
+static std::unordered_map<MacKey, uint16_t, MacHash> mac2dev;
+
+// Device# -> friendly name (optional, for your reference)
+static std::map<uint16_t, String> devNames;
+
+// Device Name (exact match) -> device#
+static std::unordered_map<String, uint16_t> name2dev;
 
 // Per-scan best RSSI by device number
 static std::unordered_map<uint16_t, int8_t> bestRssi;
@@ -62,6 +66,23 @@ static bool parseMac(const String& s, uint8_t out[6]) {
   for (int i=0;i<6;i++) out[i] = (uint8_t)v[i];
   return true;
 }
+// trim surrounding quotes if present
+static String trimQuotes(const String& in){
+  String s=in; s.trim();
+  if (s.length()>=2 && ((s.startsWith("\"") && s.endsWith("\"")) || (s.startsWith("'") && s.endsWith("'")))) {
+    return s.substring(1, s.length()-1);
+  }
+  return s;
+}
+// sanitize names for CSV store (replace commas with spaces)
+static String sanitizeForCsv(const String& s){
+  String out=s;
+  out.replace(",", " ");
+  out.replace("\r", " ");
+  out.replace("\n", " ");
+  return out;
+}
+
 static uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t crc=0xFFFF) {
   while (len--) {
     crc ^= (uint16_t)(*data++) << 8;
@@ -88,6 +109,7 @@ static void saveRoom(){ File f=SPIFFS.open("/room.txt", FILE_WRITE, true); if(f)
 static void loadRoom(){ File f=SPIFFS.open("/room.txt", FILE_READ); if(f){ g_room=(uint8_t)f.readStringUntil('\n').toInt(); f.close(); if(!g_room) g_room=1; } }
 static void saveTail(){ File f=SPIFFS.open("/tail.txt", FILE_WRITE, true); if(f){ f.printf("%d\n", g_is_tail?1:0); f.close(); } }
 static void loadTail(){ File f=SPIFFS.open("/tail.txt", FILE_READ); if(f){ g_is_tail=(f.readStringUntil('\n').toInt()!=0); f.close(); } }
+
 static void saveBinds(){
   File f=SPIFFS.open("/binds.csv", FILE_WRITE, true); if(!f) return;
   for (auto& kv: mac2dev){ char mac[18]; macToStr(kv.first.b, mac); f.printf("%s,%u\n", mac, (unsigned)kv.second); }
@@ -105,9 +127,9 @@ static void loadBinds(){
   }
   f.close();
 }
-static void saveNames(){
+static void saveNames(){ // device# -> friendly label (optional)
   File f=SPIFFS.open("/names.csv", FILE_WRITE, true); if(!f) return;
-  for (auto& kv: devNames) f.printf("%u,%s\n", (unsigned)kv.first, kv.second.c_str());
+  for (auto& kv: devNames) f.printf("%u,%s\n", (unsigned)kv.first, sanitizeForCsv(kv.second).c_str());
   f.close();
 }
 static void loadNames(){
@@ -121,25 +143,57 @@ static void loadNames(){
   }
   f.close();
 }
+// Device Name -> device# binds
+static void saveNameBinds(){
+  File f=SPIFFS.open("/namebinds.csv", FILE_WRITE, true); if(!f) return;
+  for (auto& kv: name2dev){ f.printf("%s,%u\n", sanitizeForCsv(kv.first).c_str(), (unsigned)kv.second); }
+  f.close();
+}
+static void loadNameBinds(){
+  name2dev.clear();
+  File f=SPIFFS.open("/namebinds.csv", FILE_READ); if(!f) return;
+  while (f.available()){
+    String line=f.readStringUntil('\n'); line.trim(); if(!line.length()) continue;
+    int c=line.lastIndexOf(','); if(c<0) continue; // use last comma so names can contain commas (sanitized anyway)
+    String name=line.substring(0,c);
+    uint16_t id=(uint16_t)line.substring(c+1).toInt();
+    name2dev[name]=id;
+  }
+  f.close();
+}
 
 // ====== USB CMD PARSER ======
 static String inLine;
 static void printHelp(){
   Serial.println(F("Commands:"));
-  Serial.println(F("  setroom <n>           - set this receiver's room number (1..255)"));
-  Serial.println(F("  tail on|off           - mark this receiver as tail (USB output)"));
-  Serial.println(F("  bind <MAC> <num>      - map BLE MAC to device number"));
-  Serial.println(F("  name <num> <text...>  - set friendly device name"));
-  Serial.println(F("  show room|tail|binds|names"));
-  Serial.println(F("  save                  - persist binds & names (room/tail save on set)"));
+  Serial.println(F("  setroom <n>                 - set this receiver's room number (1..255)"));
+  Serial.println(F("  tail on|off                 - mark this receiver as tail (USB output)"));
+  Serial.println(F("  bind <MAC> <num>            - map BLE MAC to device number"));
+  Serial.println(F("  bindname <name...> <num>    - map BLE Device Name to device number (quotes ok)"));
+  Serial.println(F("  name <num> <text...>        - set friendly label for a device number"));
+  Serial.println(F("  show room|tail|binds|names|namebinds"));
+  Serial.println(F("  save                        - persist all binds & names (room/tail save on set)"));
   Serial.println(F("  help"));
 }
+
 static void handleCommand(const String& s){
   int sp=s.indexOf(' '); String cmd=(sp<0)?s:s.substring(0,sp); String rest=(sp<0)?"":s.substring(sp+1); cmd.toLowerCase();
 
   if(cmd=="help"||cmd=="?"){ printHelp(); }
-  else if(cmd=="setroom"){ uint16_t n=(uint16_t)rest.toInt(); if(n<1||n>255){ Serial.println(F("ERR: room 1..255")); return; } g_room=(uint8_t)n; saveRoom(); Serial.printf("OK room=%u\n", g_room); }
-  else if(cmd=="tail"){ rest.toLowerCase(); if(rest=="on"||rest=="1"||rest=="true") g_is_tail=true; else if(rest=="off"||rest=="0"||rest=="false") g_is_tail=false; else { Serial.println(F("ERR: tail on|off")); return; } saveTail(); Serial.printf("OK tail=%d\n",(int)g_is_tail); }
+
+  else if(cmd=="setroom"){
+    uint16_t n=(uint16_t)rest.toInt(); if(n<1||n>255){ Serial.println(F("ERR: room 1..255")); return; }
+    g_room=(uint8_t)n; saveRoom(); Serial.printf("OK room=%u\n", g_room);
+  }
+
+  else if(cmd=="tail"){
+    String r=rest; r.toLowerCase();
+    if(r=="on"||r=="1"||r=="true") g_is_tail=true;
+    else if(r=="off"||r=="0"||r=="false") g_is_tail=false;
+    else { Serial.println(F("ERR: tail on|off")); return; }
+    saveTail(); Serial.printf("OK tail=%d\n",(int)g_is_tail);
+  }
+
   else if(cmd=="bind"){
     int sp2=rest.indexOf(' '); if(sp2<0){ Serial.println(F("ERR: bind <MAC> <num>")); return; }
     String smac=rest.substring(0,sp2); String sn=rest.substring(sp2+1);
@@ -147,20 +201,45 @@ static void handleCommand(const String& s){
     MacKey k; memcpy(k.b,m,6); mac2dev[k]=(uint16_t)sn.toInt();
     Serial.printf("OK bind %s -> %u\n", smac.c_str(), (unsigned)mac2dev[k]);
   }
+
+  else if(cmd=="bindname"){
+    // last token is the number; everything before is the name (quotes ok)
+    int spLast = rest.lastIndexOf(' ');
+    if (spLast<0){ Serial.println(F("ERR: bindname <name...> <num>")); return; }
+    String sname = trimQuotes(rest.substring(0, spLast));
+    uint16_t id  = (uint16_t)rest.substring(spLast+1).toInt();
+    if (!id){ Serial.println(F("ERR: invalid number")); return; }
+    name2dev[sname] = id;
+    Serial.printf("OK bindname \"%s\" -> %u\n", sname.c_str(), (unsigned)id);
+  }
+
   else if(cmd=="name"){
     int sp2=rest.indexOf(' '); if(sp2<0){ Serial.println(F("ERR: name <num> <text...>")); return; }
     uint16_t id=(uint16_t)rest.substring(0,sp2).toInt(); String nm=rest.substring(sp2+1);
     devNames[id]=nm; Serial.printf("OK name %u=\"%s\"\n",(unsigned)id,nm.c_str());
   }
-  else if(cmd=="save"){ saveBinds(); saveNames(); Serial.println(F("OK saved")); }
-  else if(cmd=="show"){
-    rest.toLowerCase();
-    if(rest=="room") Serial.printf("room=%u\n", g_room);
-    else if(rest=="tail") Serial.printf("tail=%d\n", (int)g_is_tail);
-    else if(rest=="binds"){ for(auto& kv: mac2dev){ char mac[18]; macToStr(kv.first.b,mac); Serial.printf("%s -> %u\n", mac, (unsigned)kv.second);} }
-    else if(rest=="names"){ for(auto& kv: devNames){ Serial.printf("%u,%s\n", (unsigned)kv.first, kv.second.c_str()); } }
-    else Serial.println(F("ERR: show room|tail|binds|names"));
+
+  else if(cmd=="save"){
+    saveBinds(); saveNames(); saveNameBinds();
+    Serial.println(F("OK saved"));
   }
+
+  else if(cmd=="show"){
+    String r=rest; r.toLowerCase();
+    if(r=="room") Serial.printf("room=%u\n", g_room);
+    else if(r=="tail") Serial.printf("tail=%d\n", (int)g_is_tail);
+    else if(r=="binds"){
+      for(auto& kv: mac2dev){ char mac[18]; macToStr(kv.first.b,mac); Serial.printf("%s -> %u\n", mac, (unsigned)kv.second); }
+    }
+    else if(r=="names"){
+      for(auto& kv: devNames){ Serial.printf("%u,%s\n", (unsigned)kv.first, kv.second.c_str()); }
+    }
+    else if(r=="namebinds"){
+      for(auto& kv: name2dev){ Serial.printf("\"%s\" -> %u\n", kv.first.c_str(), (unsigned)kv.second); }
+    }
+    else Serial.println(F("ERR: show room|tail|binds|names|namebinds"));
+  }
+
   else if(cmd.length()){ Serial.println(F("ERR: unknown. Type 'help'.")); }
 }
 
@@ -174,10 +253,10 @@ static void pollUsbCommands(){
 }
 
 // ====== UART1 / COBS FRAME READER ======
-static const size_t FRAME_MAX  = 1600;
+static const size_t FRAME_MAX  = 2000;
 static uint8_t frameBuf[FRAME_MAX];
 static size_t  frameLen = 0;
-static const size_t DECODE_MAX = 1600;
+static const size_t DECODE_MAX = 2000;
 static uint8_t decodeBuf[DECODE_MAX];
 
 static void processDecodedMessage(const uint8_t* m, size_t n);
@@ -236,18 +315,30 @@ static void processDecodedMessage(const uint8_t* m, size_t n){
     if (p+2>end) break; T=m[p++]; L=m[p++]; if(!(T==3 && L==1) || p+1>end) break;
     uint8_t flags=m[p++]; (void)flags;
 
-    // optional T4 NAME
-    if (p+2<=end && m[p]==4){ T=m[p++]; L=m[p++]; if (p+L<=end) p+=L; }
+    // Optional T4 NAME
+    String nameStr;
+    if (p+2<=end && m[p]==4){ T=m[p++]; L=m[p++]; if (p+L<=end){ nameStr = String((const char*)&m[p], L); p+=L; } }
 
-    // binding
-    uint16_t devNum=0xFFFF;
-    auto it=mac2dev.find(mk); if (it!=mac2dev.end()) devNum=it->second;
+    // Pick device number: NAME bind first, then MAC bind
+    uint16_t devNum = 0xFFFF;
+    if (nameStr.length()){
+      auto itn = name2dev.find(nameStr);
+      if (itn != name2dev.end()) devNum = itn->second;
+    }
+    if (devNum == 0xFFFF){
+      auto itm = mac2dev.find(mk);
+      if (itm != mac2dev.end()) devNum = itm->second;
+    }
 
 #if VERBOSE_RX
     {
       char macStr[18]; macToStr(mk.b, macStr);
-      Serial.print("RX "); Serial.print(macStr);
+      Serial.print("RX ");
+      Serial.print(macStr);
       Serial.print(" RSSI="); Serial.print((int)rssi);
+      if (nameStr.length()){
+        Serial.print(" Name=\""); Serial.print(nameStr); Serial.print("\"");
+      }
       if (devNum!=0xFFFF){ Serial.print(" -> dev "); Serial.println(devNum); }
       else               { Serial.println(" -> (no bind)"); }
     }
@@ -265,7 +356,7 @@ void setup(){
   Serial.begin(115200); delay(50);
 
   if (!SPIFFS.begin(true)) Serial.println("SPIFFS mount failed");
-  else { loadRoom(); loadTail(); loadBinds(); loadNames(); }
+  else { loadRoom(); loadTail(); loadBinds(); loadNames(); loadNameBinds(); }
 
   Serial.printf("SMOKE ready. room=%u tail=%d\n", (unsigned)g_room, (int)g_is_tail);
   printHelp();
@@ -277,6 +368,12 @@ void setup(){
 
 void loop(){
   pollICE();
-  pollUsbCommands();
+  // USB command parser (accepts CR or LF)
+  while (Serial.available()){
+    char c=(char)Serial.read();
+    static String line;
+    if (c=='\r' || c=='\n'){ line.trim(); if(line.length()) handleCommand(line); line=""; }
+    else line += c;
+  }
   // (future) ESPNOW polling here
 }
