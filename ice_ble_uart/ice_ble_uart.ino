@@ -1,279 +1,386 @@
 /*
-  ICE (ESP32-S3 N16R8) — BLE Scanner -> UART1 framed sender + USB debug
+  SMOKE Unified (ESP32-S3) — Receiver/Bridge v0
+  - Single firmware for all receivers (flash-and-go)
+  - Today: standalone "tail" mode (USB output) + config over USB + SPIFFS persistence
+  - Input: COBS-framed ICE messages on UART1 (RX=16, TX=17)
+  - Output: compact "room.device@rssi" lines on USB at END_OF_SCAN, strongest RSSI per device
 
-  UART1 (to SMOKE):
-    RX = GPIO16, TX = GPIO17
-    Baud: 921600
-    Framing: COBS + trailing 0x00
-
-  Message bytes (LE where multi-byte):
-    VER(1) TYPE(1) ORIGIN(6) BATCH(4) SEQ(2) COUNT(2) PAYLOAD(...) CRC16(2)
-    TYPE: 0=DATA, 1=END_OF_SCAN
-
-  Device TLVs in PAYLOAD (order as appended):
-    T=1 L=6  MAC6
-    T=2 L=1  RSSI (int8)
-    T=3 L=1  ADV_FLAGS (u8, 0 if unknown)
-    T=4 L=n  NAME (<=32B, optional)
+  Next steps (same firmware; config-driven):
+  - ESP-NOW upstream/downstream with fragment+ACK to chain R1->R2->R3
 */
 
 #include <Arduino.h>
-#include <BLEDevice.h>
-#include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
+#include <FS.h>
+#include <SPIFFS.h>
 
-// -------- Config --------
-#define ICE_UART_BAUD        921600
-#define ICE_UART_TX          17
-#define ICE_UART_RX          16
-#define ICE_UART_RXBUF       8192
-#define ICE_UART_TXBUF       8192
-#define SCAN_WINDOW_MS       5000
-#define NAME_MAX_LEN         32
-#define UART_PAYLOAD_TARGET  900
+// ---- UART1 for ICE ----
+#define ICE_UART_BAUD  921600
+#define ICE_UART_RX    16
+#define ICE_UART_TX    17
+#define ICE_UART_RXBUF 8192
+#define ICE_UART_TXBUF 2048
 
-// -------- CRC16-CCITT (0x1021, init 0xFFFF) --------
+// ---- Message format from ICE ----
+// VER(1) TYPE(1) ORIGIN(6) BATCH(4) SEQ(2) COUNT(2) PAYLOAD(...) CRC16(2)
+// Device TLVs in PAYLOAD: T=1 MAC(6), T=2 RSSI(1,i8), T=3 FLAGS(1), T=4 NAME(n)
+enum MsgType : uint8_t { MT_DATA=0, MT_END=1 };
+
+// ---- Config persistence ----
+static uint8_t  g_room = 1;   // 1..255
+static bool     g_is_tail = true;
+
+// Maps: BLE MAC -> device number; device number -> friendly name
+#include <map>
+#include <unordered_map>
+
+struct MacKey {
+  uint8_t b[6];
+  bool operator==(const MacKey& o) const {
+    for (int i=0;i<6;i++) if (b[i]!=o.b[i]) return false; return true;
+  }
+};
+struct MacHash {
+  size_t operator()(const MacKey& k) const {
+    // simple 48-bit fold
+    uint32_t h = (k.b[0]<<24) ^ (k.b[1]<<16) ^ (k.b[2]<<8) ^ k.b[3] ^ (k.b[4]<<4) ^ k.b[5];
+    return h;
+  }
+};
+static std::unordered_map<MacKey, uint16_t, MacHash> mac2dev;
+static std::map<uint16_t, String> devNames;
+
+// Per-scan best RSSI by device number
+static std::unordered_map<uint16_t, int8_t> bestRssi;
+
+// ---- Utilities ----
+static void macToStr(const uint8_t* m, char out[18]) {
+  sprintf(out, "%02X:%02X:%02X:%02X:%02X:%02X", m[0],m[1],m[2],m[3],m[4],m[5]);
+}
+static bool parseMac(const String& s, uint8_t out[6]) {
+  if (s.length()!=17) return false;
+  int vals[6];
+  if (sscanf(s.c_str(), "%x:%x:%x:%x:%x:%x", &vals[0],&vals[1],&vals[2],&vals[3],&vals[4],&vals[5])!=6) return false;
+  for(int i=0;i<6;i++) out[i] = (uint8_t)vals[i];
+  return true;
+}
+
+// ---- CRC16-CCITT ----
 static uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t crc=0xFFFF) {
   while (len--) {
     crc ^= (uint16_t)(*data++) << 8;
-    for (int i=0; i<8; ++i) crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+    for (int i=0;i<8;i++) crc = (crc & 0x8000) ? ((crc<<1) ^ 0x1021) : (crc<<1);
   }
   return crc;
 }
 
-// -------- COBS encode --------
-static size_t cobs_encode(const uint8_t* in, size_t len, uint8_t* out) {
+// ---- COBS decode (returns decoded length, or 0 on error) ----
+static size_t cobs_decode(const uint8_t* in, size_t len, uint8_t* out, size_t outMax) {
+  if (!len) return 0;
   const uint8_t* ip = in;
   const uint8_t* end = in + len;
   uint8_t* op = out;
-  uint8_t* code_ptr = op++;
-  uint8_t code = 1;
   while (ip < end) {
-    uint8_t b = *ip++;
-    if (b == 0) { *code_ptr = code; code_ptr = op++; code = 1; }
-    else {
-      *op++ = b; code++;
-      if (code == 0xFF) { *code_ptr = code; code_ptr = op++; code = 1; }
+    uint8_t code = *ip++;
+    if (code == 0 || ip + (code-1) > end) return 0;
+    for (uint8_t i=1; i<code; ++i) {
+      if ((size_t)(op - out) >= outMax) return 0;
+      *op++ = *ip++;
+    }
+    if (code != 0xFF && ip < end) {
+      if ((size_t)(op - out) >= outMax) return 0;
+      *op++ = 0;
     }
   }
-  *code_ptr = code;
   return (size_t)(op - out);
 }
 
-// -------- Byte helpers --------
-static inline void put_u16_le(uint8_t* p, uint16_t v){ p[0]=uint8_t(v); p[1]=uint8_t(v>>8); }
-static inline void put_u32_le(uint8_t* p, uint32_t v){ p[0]=uint8_t(v); p[1]=uint8_t(v>>8); p[2]=uint8_t(v>>16); p[3]=uint8_t(v>>24); }
-
-// -------- Globals --------
-static uint8_t ORIGIN[6];
-static uint32_t g_batch = 0;
-static uint16_t g_seq   = 0;
-
-static const size_t MSG_MAX  = 1400;
-static uint8_t msg_buf[MSG_MAX];
-static size_t  msg_len = 0;
-static size_t  payload_off = 0;
-static size_t  payload_len = 0;
-
-static const size_t COBS_MAX = MSG_MAX + (MSG_MAX/254) + 2;
-static uint8_t cobs_buf[COBS_MAX];
-
-BLEScan* g_scan = nullptr;
-
-// ---------- Forward decl ----------
-static void debug_dump_payload(uint16_t count);
-
-// ---------- Message builders ----------
-static void begin_message(uint8_t type) {
-  msg_len = 0;
-  msg_buf[msg_len++] = 1;                // VER
-  msg_buf[msg_len++] = type;             // TYPE
-  for (int i=0;i<6;i++) msg_buf[msg_len++] = ORIGIN[i];
-  put_u32_le(&msg_buf[msg_len], g_batch); msg_len += 4;
-  put_u16_le(&msg_buf[msg_len], g_seq);   msg_len += 2;
-  put_u16_le(&msg_buf[msg_len], 0);       msg_len += 2; // COUNT (later)
-  payload_off = msg_len;
-  payload_len = 0;
+// ---- SPIFFS I/O ----
+static void saveRoom() {
+  File f = SPIFFS.open("/room.txt", FILE_WRITE, true);
+  if (f) { f.printf("%u\n", (unsigned)g_room); f.close(); }
 }
-
-static void finish_and_send_message(uint16_t count) {
-  // Fill COUNT
-  put_u16_le(&msg_buf[1+1+6+4+2], count);
-  msg_len = payload_off + payload_len;
-
-  // CRC over VER..PAYLOAD
-  uint16_t crc = crc16_ccitt(msg_buf, msg_len);
-  msg_buf[msg_len++] = uint8_t(crc);
-  msg_buf[msg_len++] = uint8_t(crc >> 8);
-
-  // COBS + 0x00 out UART1 (binary for SMOKE)
-  size_t enc = cobs_encode(msg_buf, msg_len, cobs_buf);
-  cobs_buf[enc++] = 0x00;
-  Serial1.write(cobs_buf, enc);
-  Serial1.flush();
-
-  // ---- Human-readable USB debug ----
-  const uint8_t type = msg_buf[1];
-  if (type == 0) { // DATA
-    Serial.print("[batch="); Serial.print(g_batch);
-    Serial.print(" seq="); Serial.print(g_seq);
-    Serial.print(" count="); Serial.print(count);
-    Serial.println("]");
-    debug_dump_payload(count);
-  } else if (type == 1) { // END_OF_SCAN
-    Serial.println("--- END OF SCAN ---");
+static void loadRoom() {
+  File f = SPIFFS.open("/room.txt", FILE_READ);
+  if (f) { g_room = (uint8_t)f.readStringUntil('\n').toInt(); f.close(); if (g_room==0) g_room=1; }
+}
+static void saveTail() {
+  File f = SPIFFS.open("/tail.txt", FILE_WRITE, true);
+  if (f) { f.printf("%d\n", g_is_tail?1:0); f.close(); }
+}
+static void loadTail() {
+  File f = SPIFFS.open("/tail.txt", FILE_READ);
+  if (f) { g_is_tail = (f.readStringUntil('\n').toInt()!=0); f.close(); }
+}
+static void saveBinds() {
+  File f = SPIFFS.open("/binds.csv", FILE_WRITE, true);
+  if (!f) return;
+  for (auto& kv : mac2dev) {
+    char mac[18]; macToStr(kv.first.b, mac);
+    f.printf("%s,%u\n", mac, (unsigned)kv.second);
   }
-
-  g_seq++;
+  f.close();
 }
-
-static bool tlv_append(uint8_t T, const uint8_t* data, uint16_t L) {
-  if (L > 255) return false; // 1-byte L
-  if (payload_off + payload_len + 2 + L >= MSG_MAX - 2) return false; // leave room for CRC
-  msg_buf[payload_off + payload_len++] = T;
-  msg_buf[payload_off + payload_len++] = (uint8_t)L;
-  memcpy(&msg_buf[payload_off + payload_len], data, L);
-  payload_len += L;
-  return true;
-}
-
-static bool append_device_record(BLEAdvertisedDevice& d) {
-  String name = d.getName();
-  if (name.length() > NAME_MAX_LEN) name = name.substring(0, NAME_MAX_LEN);
-  size_t need = (2+6) + (2+1) + (2+1) + (name.length() ? (2+name.length()) : 0);
-  if (payload_off + payload_len + need >= MSG_MAX - 2) return false;
-
-  uint8_t mac6[6];
-  memcpy(mac6, d.getAddress().getNative(), 6);
-  int8_t  rssi_i8 = (int8_t)d.getRSSI();
-  uint8_t rssi_u8 = (uint8_t)rssi_i8;
-  uint8_t flags   = 0;
-
-  tlv_append(1, mac6, 6);
-  tlv_append(2, &rssi_u8, 1);
-  tlv_append(3, &flags, 1);
-  if (name.length()) tlv_append(4, (const uint8_t*)name.c_str(), (uint8_t)name.length());
-  return true;
-}
-
-// ---------- BLE callback ----------
-class IceScanCB : public BLEAdvertisedDeviceCallbacks {
-public:
-  uint16_t pending_count = 0;
-  void onResult(BLEAdvertisedDevice d) override {
-    if (payload_len == 0) { begin_message(0); pending_count = 0; }
-    if (!append_device_record(d)) {
-      finish_and_send_message(pending_count);
-      begin_message(0);
-      pending_count = 0;
-      (void)append_device_record(d); // must fit in fresh buffer
-    }
-    pending_count++;
-    if (payload_len >= UART_PAYLOAD_TARGET) {
-      finish_and_send_message(pending_count);
-      begin_message(0);
-      pending_count = 0;
-    }
+static void loadBinds() {
+  mac2dev.clear();
+  File f = SPIFFS.open("/binds.csv", FILE_READ);
+  if (!f) return;
+  while (f.available()) {
+    String line = f.readStringUntil('\n'); line.trim();
+    if (!line.length()) continue;
+    int comma = line.indexOf(',');
+    if (comma<0) continue;
+    String smac = line.substring(0, comma);
+    String snum = line.substring(comma+1);
+    uint8_t m[6]; if (!parseMac(smac, m)) continue;
+    MacKey k; memcpy(k.b, m, 6);
+    mac2dev[k] = (uint16_t)snum.toInt();
   }
-};
-static IceScanCB g_cb;
-
-// ---------- Debug dump (USB) ----------
-static void mac_to_str(const uint8_t* m, char* out18) {
-  sprintf(out18, "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
+  f.close();
+}
+static void saveNames() {
+  File f = SPIFFS.open("/names.csv", FILE_WRITE, true);
+  if (!f) return;
+  for (auto& kv : devNames) {
+    f.printf("%u,%s\n", (unsigned)kv.first, kv.second.c_str());
+  }
+  f.close();
+}
+static void loadNames() {
+  devNames.clear();
+  File f = SPIFFS.open("/names.csv", FILE_READ);
+  if (!f) return;
+  while (f.available()) {
+    String line = f.readStringUntil('\n'); line.trim();
+    if (!line.length()) continue;
+    int comma = line.indexOf(',');
+    if (comma<0) continue;
+    uint16_t id = (uint16_t) line.substring(0, comma).toInt();
+    String nm = line.substring(comma+1);
+    devNames[id] = nm;
+  }
+  f.close();
 }
 
-// Parse TLVs in the known order for 'count' device records and print them.
-static void debug_dump_payload(uint16_t count) {
-  size_t p = payload_off;
-  const size_t end = payload_off + payload_len;
+// ---- Command parser over USB ----
+static String inLine;
+static void printHelp() {
+  Serial.println(F("Commands:"));
+  Serial.println(F("  setroom <n>           - set this receiver's room number (1..255)"));
+  Serial.println(F("  tail on|off           - mark this receiver as tail (USB output)"));
+  Serial.println(F("  bind <MAC> <num>      - map BLE MAC to device number (e.g. bind AA:BB:CC:DD:EE:FF 12)"));
+  Serial.println(F("  name <num> <text...>  - set friendly device name"));
+  Serial.println(F("  show room|tail|binds|names"));
+  Serial.println(F("  save                  - persist binds & names (room/tail save on set)"));
+  Serial.println(F("  help"));
+}
+static void handleCommand(const String& s) {
+  // split first token
+  int sp = s.indexOf(' ');
+  String cmd = (sp<0) ? s : s.substring(0,sp);
+  String rest = (sp<0) ? "" : s.substring(sp+1);
 
-  for (uint16_t i = 0; i < count && p + 2 <= end; ++i) {
-    // Expect MAC TLV
-    if (p + 2 > end) break;
-    uint8_t T = msg_buf[p++], L = msg_buf[p++];
-    if (!(T == 1 && L == 6) || p + 6 > end) break;
-    char macStr[18];
-    mac_to_str(&msg_buf[p], macStr);
-    p += 6;
+  cmd.toLowerCase();
 
-    // RSSI TLV
-    if (p + 2 > end) break;
-    T = msg_buf[p++]; L = msg_buf[p++];
-    int8_t rssi = 0;
-    if (T == 2 && L == 1 && p + 1 <= end) { rssi = (int8_t)msg_buf[p++]; }
-    else { break; }
-
-    // FLAGS TLV
-    if (p + 2 > end) break;
-    T = msg_buf[p++]; L = msg_buf[p++];
-    if (!(T == 3 && L == 1) || p + 1 > end) break;
-    uint8_t flags = msg_buf[p++]; (void)flags;
-
-    // Optional NAME TLV
-    String name;
-    if (p + 2 <= end && msg_buf[p] == 4) {
-      T = msg_buf[p++]; L = msg_buf[p++];
-      if (p + L <= end) {
-        name = String((const char*)&msg_buf[p], L);
-        p += L;
+  if (cmd == "help" || cmd == "?") {
+    printHelp();
+  } else if (cmd == "setroom") {
+    uint16_t n = (uint16_t)rest.toInt();
+    if (n==0 || n>255) { Serial.println(F("ERR: room must be 1..255")); return; }
+    g_room = (uint8_t)n; saveRoom();
+    Serial.printf("OK room=%u\n", g_room);
+  } else if (cmd == "tail") {
+    rest.toLowerCase();
+    if (rest=="on" || rest=="1" || rest=="true") g_is_tail = true;
+    else if (rest=="off" || rest=="0" || rest=="false") g_is_tail = false;
+    else { Serial.println(F("ERR: usage tail on|off")); return; }
+    saveTail();
+    Serial.printf("OK tail=%d\n", (int)g_is_tail);
+  } else if (cmd == "bind") {
+    int sp2 = rest.indexOf(' ');
+    if (sp2<0) { Serial.println(F("ERR: bind <MAC> <num>")); return; }
+    String smac = rest.substring(0, sp2);
+    String snum = rest.substring(sp2+1);
+    uint8_t m[6];
+    if (!parseMac(smac, m)) { Serial.println(F("ERR: bad MAC")); return; }
+    uint16_t id = (uint16_t)snum.toInt();
+    MacKey k; memcpy(k.b, m, 6);
+    mac2dev[k] = id;
+    Serial.printf("OK bind %s -> %u\n", smac.c_str(), (unsigned)id);
+  } else if (cmd == "name") {
+    int sp2 = rest.indexOf(' ');
+    if (sp2<0) { Serial.println(F("ERR: name <num> <text...>")); return; }
+    uint16_t id = (uint16_t)rest.substring(0, sp2).toInt();
+    String nm = rest.substring(sp2+1);
+    devNames[id] = nm;
+    Serial.printf("OK name %u=\"%s\"\n", (unsigned)id, nm.c_str());
+  } else if (cmd == "save") {
+    saveBinds(); saveNames();
+    Serial.println(F("OK saved"));
+  } else if (cmd == "show") {
+    rest.toLowerCase();
+    if (rest=="room") Serial.printf("room=%u\n", g_room);
+    else if (rest=="tail") Serial.printf("tail=%d\n", (int)g_is_tail);
+    else if (rest=="binds") {
+      for (auto& kv : mac2dev) {
+        char mac[18]; macToStr(kv.first.b, mac);
+        Serial.printf("%s -> %u\n", mac, (unsigned)kv.second);
       }
-    }
-
-    Serial.print("MAC="); Serial.print(macStr);
-    Serial.print(" RSSI="); Serial.print(rssi);
-    if (name.length()) { Serial.print(" Name=\""); Serial.print(name); Serial.print("\""); }
-    Serial.println();
+    } else if (rest=="names") {
+      for (auto& kv : devNames) {
+        Serial.printf("%u,%s\n", (unsigned)kv.first, kv.second.c_str());
+      }
+    } else Serial.println(F("ERR: show what? room|tail|binds|names"));
+  } else if (cmd.length()) {
+    Serial.println(F("ERR: unknown. Type 'help'."));
   }
 }
 
-// ---------- Setup / Loop ----------
-static void fill_origin_mac() {
-  uint64_t mac = ESP.getEfuseMac();
-  ORIGIN[0] = (uint8_t)(mac >> 40);
-  ORIGIN[1] = (uint8_t)(mac >> 32);
-  ORIGIN[2] = (uint8_t)(mac >> 24);
-  ORIGIN[3] = (uint8_t)(mac >> 16);
-  ORIGIN[4] = (uint8_t)(mac >>  8);
-  ORIGIN[5] = (uint8_t)(mac >>  0);
+// ---- UART1/COBS frame reader from ICE ----
+static const size_t FRAME_MAX = 1600;
+static uint8_t frameBuf[FRAME_MAX];
+static size_t  frameLen = 0;
+
+static const size_t DECODE_MAX = 1600;
+static uint8_t decodeBuf[DECODE_MAX];
+
+static void processDecodedMessage(const uint8_t* m, size_t n);
+
+// read bytes, split by 0x00 delimiter, then cobs-decode and process
+static void pollICE() {
+  while (Serial1.available()) {
+    uint8_t b = (uint8_t)Serial1.read();
+    if (b == 0x00) {
+      if (frameLen > 0) {
+        size_t dec = cobs_decode(frameBuf, frameLen, decodeBuf, DECODE_MAX);
+        if (dec > 0) processDecodedMessage(decodeBuf, dec);
+        frameLen = 0;
+      }
+    } else {
+      if (frameLen < FRAME_MAX) frameBuf[frameLen++] = b;
+      else frameLen = 0; // overflow guard: reset
+    }
+  }
 }
 
-void setup() {
-  // USB CDC for human-readable testing
-  Serial.begin(115200);
+// ---- Parse ICE message and collect strongest RSSI per device ----
+static uint32_t curBatch = 0;
+static uint32_t lastSeenBatch = 0;
 
-  // Hardware UART1 — binary framed output for SMOKE (later)
+static void endOfScanFlush() {
+  // Print compact lines: room.device@rssi
+  if (!g_is_tail) {
+    // In the next version we'll forward upstream here via ESP-NOW.
+    // For now still print if configured tail=false to let you test.
+  }
+  for (auto &kv : bestRssi) {
+    uint16_t dev = kv.first;
+    int8_t rssi = kv.second;
+    Serial.printf("%u.%u@%d\n", (unsigned)g_room, (unsigned)dev, (int)rssi);
+  }
+  bestRssi.clear();
+  Serial.println("--- END OF SCAN ---");
+}
+
+static void processDecodedMessage(const uint8_t* m, size_t n) {
+  if (n < 1+1+6+4+2+2+2) return; // min header + CRC
+  uint8_t ver = m[0];
+  uint8_t typ = m[1];
+  (void)ver;
+  // origin(6) at m+2 (we don't need it for tail mode)
+  const uint8_t* origin = m+2;
+  uint32_t batch = (uint32_t)m[8] | ((uint32_t)m[9]<<8) | ((uint32_t)m[10]<<16) | ((uint32_t)m[11]<<24);
+  uint16_t seq   = (uint16_t)m[12] | ((uint16_t)m[13]<<8);
+  uint16_t count = (uint16_t)m[14] | ((uint16_t)m[15]<<8);
+
+  size_t pay_off = 1+1+6+4+2+2;
+  size_t pay_len = n - pay_off - 2;
+  if ((int)pay_len < 0) return;
+
+  // CRC check
+  uint16_t given = (uint16_t)m[n-2] | ((uint16_t)m[n-1]<<8);
+  uint16_t calc  = crc16_ccitt(m, n-2);
+  if (given != calc) return;
+
+  if (typ == MT_END) {
+    endOfScanFlush();
+    lastSeenBatch = batch;
+    return;
+  }
+
+  // DATA: iterate TLVs for each device record
+  size_t p = pay_off;
+  for (uint16_t i=0; i<count; ++i) {
+    // Expect T1 MAC(6), T2 RSSI(1), T3 FLAGS(1), optional T4 NAME
+    if (p+2 > n-2) break;
+    uint8_t T = m[p++], L = m[p++];
+    if (!(T==1 && L==6) || p+6 > n-2) break;
+    MacKey mk; memcpy(mk.b, &m[p], 6); p += 6;
+
+    if (p+2 > n-2) break;
+    T = m[p++]; L = m[p++];
+    if (!(T==2 && L==1) || p+1 > n-2) break;
+    int8_t rssi = (int8_t)m[p++];
+
+    if (p+2 > n-2) break;
+    T = m[p++]; L = m[p++];
+    if (!(T==3 && L==1) || p+1 > n-2) break;
+    uint8_t flags = m[p++]; (void)flags;
+
+    // optional NAME
+    if (p+2 <= n-2 && m[p]==4) {
+      T = m[p++]; L = m[p++];
+      if (p+L <= n-2) p += L; // skip
+    }
+
+    // Map MAC -> device number
+    uint16_t devNum = 0xFFFF; // unknown
+    auto it = mac2dev.find(mk);
+    if (it != mac2dev.end()) devNum = it->second;
+
+    if (devNum != 0xFFFF) {
+      auto br = bestRssi.find(devNum);
+      if (br == bestRssi.end() || rssi > br->second) {
+        bestRssi[devNum] = rssi; // keep strongest
+      }
+    } else {
+      // Unknown devices are ignored for compact mode.
+      // (We can add a flag later to show them as 0.<hash>@rssi or similar.)
+    }
+  }
+}
+
+// ---- Setup/Loop ----
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed");
+  } else {
+    loadRoom();
+    loadTail();
+    loadBinds();
+    loadNames();
+  }
+  Serial.printf("SMOKE ready. room=%u tail=%d\n", (unsigned)g_room, (int)g_is_tail);
+  printHelp();
+
   Serial1.setRxBufferSize(ICE_UART_RXBUF);
   Serial1.setTxBufferSize(ICE_UART_TXBUF);
   Serial1.begin(ICE_UART_BAUD, SERIAL_8N1, ICE_UART_RX, ICE_UART_TX);
-
-  fill_origin_mac();
-
-  // BLE init (Arduino-ESP32 uses NimBLE on S3)
-  BLEDevice::init("");
-  g_scan = BLEDevice::getScan();
-  g_scan->setAdvertisedDeviceCallbacks(&g_cb, true); // wantDuplicates
-  g_scan->setActiveScan(true);
-  g_scan->setInterval(160); // 100ms
-  g_scan->setWindow(120);   // 75ms
 }
 
+static uint32_t lastCmdPoll = 0;
 void loop() {
-  g_seq = 0; // reset per batch
+  // Poll ICE UART for frames
+  pollICE();
 
-  // Run scan window (seconds, float)
-  g_scan->start(SCAN_WINDOW_MS / 1000.0, false);
-
-  // Flush any partial message left by callback
-  if (payload_len > 0 && g_cb.pending_count > 0) {
-    finish_and_send_message(g_cb.pending_count);
-    g_cb.pending_count = 0;
+  // Read user commands on USB
+  if (Serial.available()) {
+    String s = Serial.readStringUntil('\n');
+    s.trim();
+    if (s.length()) handleCommand(s);
   }
 
-  // END marker
-  begin_message(1);
-  finish_and_send_message(0);
-
-  g_batch++;
-  delay(100);
+  // (Future) ESP-NOW poll here
 }
