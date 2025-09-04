@@ -1,4 +1,6 @@
-/*  SMOKE Unified (ESP32-S3) — Receiver/Bridge v2.1 (room-aware, AGG/FLUSH debug)  */
+/*  SMOKE Unified (ESP32-S3) — Receiver/Bridge v2.2 (visibility build)
+    - Shows per-fragment TX/RX, missing-index timeouts, and parse results
+*/
 
 #include <Arduino.h>
 #include <FS.h>
@@ -10,8 +12,9 @@
 #include <unordered_map>
 #include <vector>
 
-#define VERBOSE_RX     1
-#define ESN_DEBUG      1
+// ---------------- CONFIG ----------------
+#define VERBOSE_RX  1      // prints per-record decode
+#define ESN_DEBUG   1      // prints per-fragment TX/RX
 
 #define UART_BAUD_ICE  921600
 #define ICE_UART_RX    16
@@ -19,11 +22,14 @@
 #define ICE_UART_RXBUF 16384
 #define ICE_UART_TXBUF 2048
 
-#define ESN_PAYLOAD_MAX   250
-#define ESN_FRAG_DATA_MAX 200
+// Payload tuning: a bit smaller to help reliability
+#define ESN_PAYLOAD_MAX    250
+#define ESN_FRAG_DATA_MAX  160
 
+// ICE payload format
 enum MsgType : uint8_t { MT_DATA=0, MT_END=1 };
 
+// ESP-NOW wrapper header
 struct __attribute__((packed)) EsnFrag {
   uint8_t  magic0, magic1, ver, src_room, total, index;
   uint8_t  origin[6];
@@ -33,46 +39,54 @@ struct __attribute__((packed)) EsnFrag {
   uint8_t  data[];
 };
 
+// ---------------- STATE ----------------
 static uint8_t  g_room=1, g_channel=6;
 static bool     g_is_tail=true, g_esn_on=false;
 
-struct MacKey { uint8_t b[6]; bool operator==(const MacKey& o) const { for(int i=0;i<6;i++) if(b[i]!=o.b[i]) return false; return true; } };
+struct MacKey { uint8_t b[6]; bool operator==(const MacKey& o) const { for (int i=0;i<6;i++) if(b[i]!=o.b[i]) return false; return true; } };
 struct MacHash { size_t operator()(const MacKey& k) const { uint32_t h=(k.b[0]<<24)^(k.b[1]<<16)^(k.b[2]<<8)^k.b[3]^(k.b[4]<<4)^k.b[5]; return h; } };
 
 static std::unordered_map<MacKey,uint16_t,MacHash> mac2dev;
 static std::map<String,uint16_t> name2dev;
 
+// room-aware best RSSI per scan
 struct RoomDevKey { uint8_t room; uint16_t dev; bool operator==(const RoomDevKey& o) const { return room==o.room && dev==o.dev; } };
 struct RoomDevHash { size_t operator()(const RoomDevKey& k) const { return ((size_t)k.room<<16) ^ (size_t)k.dev; } };
 static std::unordered_map<RoomDevKey,int8_t,RoomDevHash> bestRssi;
 
 static std::vector<String> seenNames; size_t g_seen_max=128;
 
+// de-dup (origin,batch,seq,src_room)
 struct SeenKey { uint8_t origin[6]; uint32_t batch; uint16_t seq; uint8_t src_room; };
 static const size_t SEEN_CACHE_MAX=256;
 static std::vector<SeenKey> seenCache;
 
+// broadcast peer
 static uint8_t ESN_BROADCAST[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
+// UART frame buffers (COBS)
 static const size_t FRAME_MAX=2000, DECODE_MAX=2000;
 static uint8_t frameBuf[FRAME_MAX]; size_t frameLen=0;
 static uint8_t decodeBuf[DECODE_MAX];
 
+// reassembly
 struct ReasmBuf {
   uint8_t  src_room, origin[6], total;
   uint32_t batch;
   uint16_t seq;
-  std::vector<bool> have;
-  std::vector<uint16_t> frag_len;          // track length per chunk
-  std::vector<uint8_t> data;               // full-size buffer
+  std::vector<bool>     have;
+  std::vector<uint16_t> frag_len;
+  std::vector<uint8_t>  data;     // laid out by index * ESN_FRAG_DATA_MAX
+  uint32_t first_ms;
   uint32_t last_ms;
 };
 static std::vector<ReasmBuf> reasmList;
 
+// ---------------- UTILS ----------------
 static void macToStr(const uint8_t* m, char out[18]) { sprintf(out,"%02X:%02X:%02X:%02X:%02X:%02X",m[0],m[1],m[2],m[3],m[4],m[5]); }
 static bool parseMac(const String& s, uint8_t out[6]){ if(s.length()!=17) return false; int v[6]; if(sscanf(s.c_str(), "%x:%x:%x:%x:%x:%x",&v[0],&v[1],&v[2],&v[3],&v[4],&v[5])!=6) return false; for(int i=0;i<6;i++) out[i]=(uint8_t)v[i]; return true; }
 static String trimQuotes(String s){ s.trim(); if(s.length()>=2 && ((s.startsWith("\"")&&s.endsWith("\""))||(s.startsWith("'")&&s.endsWith("'")))) return s.substring(1,s.length()-1); return s; }
-static String sanitizePrefix(const String& in){ String out; out.reserve(in.length()); for(size_t i=0;i<in.length();++i){ uint8_t c=(uint8_t)in[i]; if(c<32||c>126) break; out+=(char)c; } out.trim(); String col; col.reserve(out.length()); bool sp=false; for(char c:out){ if(c==' '||c=='\t'){ if(!sp){ col+=' '; sp=true; } } else { col+=c; sp=false; } } return col; }
+static String sanitizePrefix(const String& in){ String o; o.reserve(in.length()); for(size_t i=0;i<in.length();++i){ uint8_t c=(uint8_t)in[i]; if(c<32||c>126) break; o+=(char)c; } o.trim(); String c; c.reserve(o.length()); bool sp=false; for(char ch:o){ if(ch==' '||ch=='\t'){ if(!sp){ c+=' '; sp=true; } } else { c+=ch; sp=false; } } return c; }
 static String sanitizeForCsv(const String& s){ String o=s; o.replace(","," "); o.replace("\r"," "); o.replace("\n"," "); return o; }
 static uint16_t crc16_ccitt(const uint8_t* d,size_t n,uint16_t crc=0xFFFF){ while(n--){ crc^=(uint16_t)(*d++)<<8; for(int i=0;i<8;i++) crc=(crc&0x8000)?((crc<<1)^0x1021):(crc<<1);} return crc; }
 static size_t cobs_decode(const uint8_t* in,size_t len,uint8_t* out,size_t outMax){
@@ -83,7 +97,7 @@ static size_t cobs_decode(const uint8_t* in,size_t len,uint8_t* out,size_t outMa
   } return (size_t)(op-out);
 }
 
-// ---------- persistence ----------
+// ---------------- PERSISTENCE ----------------
 static void saveRoom(){ File f=SPIFFS.open("/room.txt", FILE_WRITE, true); if(f){ f.printf("%u\n",(unsigned)g_room); f.close(); } }
 static void loadRoom(){ File f=SPIFFS.open("/room.txt", FILE_READ); if(f){ g_room=(uint8_t)f.readStringUntil('\n').toInt(); f.close(); if(!g_room) g_room=1; } }
 static void saveTail(){ File f=SPIFFS.open("/tail.txt", FILE_WRITE, true); if(f){ f.printf("%d\n", g_is_tail?1:0); f.close(); } }
@@ -95,7 +109,7 @@ static void loadBinds(){ mac2dev.clear(); File f=SPIFFS.open("/binds.csv", FILE_
 static void saveNameBinds(){ File f=SPIFFS.open("/namebinds.csv", FILE_WRITE, true); if(!f) return; for(auto& kv:name2dev) f.printf("%s,%u\n", sanitizeForCsv(kv.first).c_str(), (unsigned)kv.second); f.close(); }
 static void loadNameBinds(){ name2dev.clear(); File f=SPIFFS.open("/namebinds.csv", FILE_READ); if(!f) return; while(f.available()){ String line=f.readStringUntil('\n'); line.trim(); if(!line.length()) continue; int c=line.lastIndexOf(','); if(c<0) continue; String nm=line.substring(0,c); uint16_t id=(uint16_t)line.substring(c+1).toInt(); name2dev[nm]=id; } f.close(); }
 
-// ---------- commands ----------
+// ---------------- COMMANDS ----------------
 static void printHelp(){
   Serial.println(F("Commands:"));
   Serial.println(F("  setroom <n>              ; set this receiver's room number (1..255)"));
@@ -107,7 +121,19 @@ static void printHelp(){
   Serial.println(F("  seen                     ; list recent sanitized names"));
   Serial.println(F("  bindseen <idx> <num>     ; bind 'seen' entry idx to number"));
   Serial.println(F("  show room|tail|binds|namebinds|esn|channel"));
+  Serial.println(F("  stats                    ; show ESPNOW reassembly slots (debug)"));
   Serial.println(F("  save"));
+}
+static void dumpStats(){
+  if(!reasmList.size()){ Serial.println(F("[STATS] no reassembly slots")); return; }
+  for(const auto& rb:reasmList){
+    Serial.printf("[STATS] src_room=%u total=%u batch=%lu seq=%u age=%ums miss=",
+      (unsigned)rb.src_room,(unsigned)rb.total,(unsigned long)rb.batch,(unsigned)rb.seq,(unsigned)(millis()-rb.first_ms));
+    bool first=true;
+    for(uint8_t i=0;i<rb.total;i++){ if(!rb.have[i]){ if(!first) Serial.print(','); Serial.print(i); first=false; } }
+    if(first) Serial.print('-');
+    Serial.println();
+  }
 }
 static void handleCommand(const String& s){
   int sp=s.indexOf(' '); String cmd=(sp<0)?s:s.substring(0,sp); String rest=(sp<0)?"":s.substring(sp+1); cmd.toLowerCase();
@@ -121,27 +147,41 @@ static void handleCommand(const String& s){
   else if(cmd=="seen"){ for(size_t i=0;i<seenNames.size();++i) Serial.printf("[%u] %s\n", (unsigned)i, seenNames[i].c_str()); }
   else if(cmd=="bindseen"){ int sp2=rest.indexOf(' '); if(sp2<0){ Serial.println(F("ERR: bindseen <idx> <num>")); return; } int idx=rest.substring(0,sp2).toInt(); uint16_t id=(uint16_t)rest.substring(sp2+1).toInt(); if(idx<0||(size_t)idx>=seenNames.size()){ Serial.println(F("ERR: idx out of range")); return; } String san=seenNames[(size_t)idx]; name2dev[san]=id; Serial.printf("OK bindseen [%d] \"%s\" -> %u\n", idx, san.c_str(), (unsigned)id); }
   else if(cmd=="show"){ String r=rest; r.toLowerCase(); if(r=="room") Serial.printf("room=%u\n", g_room); else if(r=="tail") Serial.printf("tail=%d\n",(int)g_is_tail); else if(r=="esn") Serial.printf("esn=%d\n",(int)g_esn_on); else if(r=="channel") Serial.printf("channel=%u\n",(unsigned)g_channel); else if(r=="binds"){ for(auto& kv:mac2dev){ char mac[18]; macToStr(kv.first.b,mac); Serial.printf("%s -> %u\n", mac, (unsigned)kv.second);} } else if(r=="namebinds"){ for(auto& kv:name2dev){ Serial.printf("\"%s\" -> %u\n", kv.first.c_str(), (unsigned)kv.second);} } else Serial.println(F("ERR: show room|tail|binds|namebinds|esn|channel")); }
+  else if(cmd=="stats"){ dumpStats(); }
   else if(cmd=="save"){ saveBinds(); saveNameBinds(); saveEsn(); Serial.println(F("OK saved")); }
   else if(cmd.length()){ Serial.println(F("ERR: unknown. Type 'help'.")); }
 }
 static void pollUsb(){ while(Serial.available()){ static String line; char c=(char)Serial.read(); if(c=='\r'||c=='\n'){ line.trim(); if(line.length()) handleCommand(line); line=""; } else line+=c; } }
 
+// forward decl
 void processDecodedMessage(const uint8_t* m, size_t n, uint8_t src_room, bool from_esn);
 
-// ---------- ESP-NOW ----------
+// ---------------- ESP-NOW ----------------
 static bool esnInited=false;
-static void esn_teardown(){ if(!esnInited) return; esp_now_deinit(); WiFi.mode(WIFI_OFF); esnInited=false; }
+
+static void esn_teardown(){
+  if(!esnInited) return;
+  esp_now_deinit();
+  WiFi.mode(WIFI_OFF);
+  esnInited=false;
+}
+
 static bool esn_setup(){
   if(!g_esn_on){ esn_teardown(); return false; }
   WiFi.mode(WIFI_STA);
+
+  // lock channel & boost power
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_channel(g_channel, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
+  esp_wifi_set_max_tx_power(84); // ~21 dBm on ESP32-S3
+
   if(esp_now_init()!=ESP_OK){ Serial.println("ESP-NOW init failed"); return false; }
   esnInited=true;
+
   esp_now_peer_info_t peer{}; memcpy(peer.peer_addr, ESN_BROADCAST, 6); peer.channel=g_channel; peer.encrypt=false; esp_now_add_peer(&peer);
 
-  // Arduino-ESP32 3.x callback signature
+  // RX callback (3.x signature)
   esp_now_register_recv_cb([](const esp_now_recv_info_t* info, const uint8_t* data, int len){
     (void)info;
     if(len<(int)sizeof(EsnFrag)) return;
@@ -153,24 +193,30 @@ static bool esn_setup(){
     Serial.printf("[ESN-RX] src_room=%u idx=%u/%u frag=%u bytes\n",
                   (unsigned)h->src_room, (unsigned)h->index, (unsigned)h->total, (unsigned)h->frag_len);
 #endif
-    if(!(h->src_room==g_room||h->src_room==(uint8_t)(g_room-1))) return;
+    if(!(h->src_room==g_room || h->src_room==(uint8_t)(g_room-1))) return;
 
     uint32_t now=millis();
     int slot=-1;
     for(size_t i=0;i<reasmList.size();++i){
       ReasmBuf& rb=reasmList[i];
-      if(rb.src_room==h->src_room && rb.batch==h->batch && rb.seq==h->seq && memcmp(rb.origin,h->origin,6)==0){ slot=(int)i; break; }
-      if(now-rb.last_ms>3000){ reasmList.erase(reasmList.begin()+i); --i; }
+      // timeout & report missing
+      if(now-rb.last_ms>1500){
+        Serial.printf("[ESN-RX] timeout src_room=%u batch=%lu seq=%u missing={",
+                      (unsigned)rb.src_room,(unsigned long)rb.batch,(unsigned)rb.seq);
+        bool first=true; for(uint8_t j=0;j<rb.total;j++){ if(!rb.have[j]){ if(!first) Serial.print(','); Serial.print(j); first=false; } }
+        Serial.println("}");
+        reasmList.erase(reasmList.begin()+i); --i; continue;
+      }
+      if(rb.src_room==h->src_room && rb.batch==h->batch && rb.seq==h->seq && memcmp(rb.origin,h->origin,6)==0){ slot=(int)i; }
     }
     if(slot<0){
       ReasmBuf rb{};
-      rb.src_room=h->src_room;
-      memcpy(rb.origin,h->origin,6);
+      rb.src_room=h->src_room; memcpy(rb.origin,h->origin,6);
       rb.batch=h->batch; rb.seq=h->seq; rb.total=h->total;
       rb.have.assign(h->total,false);
       rb.frag_len.assign(h->total,0);
       rb.data.assign((size_t)h->total * (size_t)ESN_FRAG_DATA_MAX, 0);
-      rb.last_ms=now;
+      rb.first_ms = rb.last_ms = now;
       reasmList.push_back(rb);
       slot=(int)reasmList.size()-1;
     }
@@ -179,21 +225,19 @@ static bool esn_setup(){
     if(!rb.have[h->index]){
       rb.have[h->index]=true;
       rb.frag_len[h->index]=h->frag_len;
-      size_t off=(size_t)h->index*(size_t)ESN_FRAG_DATA_MAX;
-      memcpy(&rb.data[off], h->data, h->frag_len);
+      memcpy(&rb.data[(size_t)h->index*(size_t)ESN_FRAG_DATA_MAX], h->data, h->frag_len);
       rb.last_ms=now;
     }
-    bool complete=true;
-    for(bool b:rb.have) if(!b){ complete=false; break; }
+    bool complete=true; for(bool b:rb.have) if(!b){ complete=false; break; }
     if(complete){
-      size_t total_len=0;
-      for(uint8_t i=0;i<rb.total;i++) total_len += rb.frag_len[i];
+      size_t total_len=0; for(uint8_t i=0;i<rb.total;i++) total_len+=rb.frag_len[i];
       std::vector<uint8_t> msg; msg.reserve(total_len);
       for(uint8_t i=0;i<rb.total;i++){
         size_t off=(size_t)i*(size_t)ESN_FRAG_DATA_MAX;
         msg.insert(msg.end(), rb.data.begin()+off, rb.data.begin()+off+rb.frag_len[i]);
       }
 
+      // de-dup (protect against echo)
       SeenKey sk{}; memcpy(sk.origin, rb.origin, 6); sk.batch=rb.batch; sk.seq=rb.seq; sk.src_room=rb.src_room;
       bool duplicate=false;
       for(auto& k:seenCache){ if(k.src_room==sk.src_room && k.batch==sk.batch && k.seq==sk.seq && memcmp(k.origin,sk.origin,6)==0){ duplicate=true; break; } }
@@ -210,16 +254,32 @@ static bool esn_setup(){
     }
   });
 
-  esp_now_register_send_cb(nullptr);
+  // TX result callback (lets you verify every fragment goes out OK)
+  esp_now_register_send_cb([](const uint8_t* mac, esp_now_send_status_t status){
+    (void)mac;
+#if ESN_DEBUG
+    // No idx info here; we log per-idx at send time below.
+    Serial.printf("[ESN-SENT] status=%s\n", status==ESP_NOW_SEND_SUCCESS?"OK":"FAIL");
+#endif
+  });
+
   return true;
 }
 
-static void esn_send_frag(const EsnFrag* hdr, size_t bytes){ if(!esnInited) return; esp_now_send(ESN_BROADCAST, (const uint8_t*)hdr, bytes); }
+static void esn_send_frag(const EsnFrag* hdr, size_t bytes){
+  if(!esnInited) return;
+  esp_now_send(ESN_BROADCAST, (const uint8_t*)hdr, bytes);
+}
 
 static void forward_upstream(uint8_t src_room, const uint8_t* decoded, size_t n, const uint8_t* origin, uint32_t batch, uint16_t seq){
   if(!g_esn_on || g_is_tail) return;
   if(!(src_room==g_room || src_room==(uint8_t)(g_room-1))) return;
+
   uint8_t total=(uint8_t)((n+(size_t)ESN_FRAG_DATA_MAX-1)/(size_t)ESN_FRAG_DATA_MAX); if(total==0) total=1;
+#if ESN_DEBUG
+  Serial.printf("[ESN-TX] src_room=%u total=%u batch=%lu seq=%u len=%u\n",
+                (unsigned)src_room,(unsigned)total,(unsigned long)batch,(unsigned)seq,(unsigned)n);
+#endif
   for(uint8_t idx=0; idx<total; ++idx){
     size_t off=(size_t)idx*(size_t)ESN_FRAG_DATA_MAX; size_t left=n-off;
     size_t take=(left<(size_t)ESN_FRAG_DATA_MAX)?left:(size_t)ESN_FRAG_DATA_MAX;
@@ -228,33 +288,24 @@ static void forward_upstream(uint8_t src_room, const uint8_t* decoded, size_t n,
     memcpy(h->origin,origin,6); h->batch=batch; h->seq=seq; h->frag_len=(uint16_t)take;
     memcpy(h->data, decoded+off, take); size_t bytes=sizeof(EsnFrag)+take;
 #if ESN_DEBUG
-    if(idx==0) Serial.printf("[ESN-TX] src_room=%u total=%u batch=%lu seq=%u len=%u\n",
-                              (unsigned)src_room,(unsigned)total,(unsigned long)batch,(unsigned)seq,(unsigned)n);
+    Serial.printf("  [ESN-TX] idx=%u bytes=%u\n",(unsigned)idx,(unsigned)bytes);
 #endif
     esn_send_frag(h, bytes);
   }
 }
 
-// ---------- pipeline ----------
+// ---------------- PIPELINE ----------------
 static void addSeen(const String& san){ if(!san.length()) return; for(size_t i=0;i<seenNames.size();++i){ if(seenNames[i]==san){ if(i!=0){ seenNames.erase(seenNames.begin()+i); seenNames.insert(seenNames.begin(),san);} return; } } seenNames.insert(seenNames.begin(),san); if(seenNames.size()>g_seen_max) seenNames.pop_back(); }
 
 static void endOfScanFlush(uint8_t flush_room){
-  uint32_t n=0;
-  for (auto &kv : bestRssi){
-    if (kv.first.room == flush_room){
-      ++n;
-      Serial.printf("%u.%u@%d\n",
-                    (unsigned)kv.first.room,
-                    (unsigned)kv.first.dev,
-                    (int)kv.second);
+  std::vector<RoomDevKey> erase;
+  for(auto& kv:bestRssi){
+    if(kv.first.room==flush_room){
+      Serial.printf("%u.%u@%d\n",(unsigned)kv.first.room,(unsigned)kv.first.dev,(int)kv.second);
+      erase.push_back(kv.first);
     }
   }
-  // erase only what we printed
-  std::vector<RoomDevKey> toErase;
-  for (auto &kv : bestRssi) if (kv.first.room==flush_room) toErase.push_back(kv.first);
-  for (auto &k : toErase) bestRssi.erase(k);
-
-  Serial.printf("[FLUSH] room=%u entries=%lu\n", (unsigned)flush_room, (unsigned long)n);
+  for(auto& k:erase) bestRssi.erase(k);
   Serial.println("--- END OF SCAN ---");
 }
 
@@ -309,22 +360,15 @@ void processDecodedMessage(const uint8_t* m, size_t n, uint8_t src_room, bool /*
       if(devNum==0xFFFF){ auto itm=mac2dev.find(mk); if(itm!=mac2dev.end()) devNum=itm->second; }
 
 #if VERBOSE_RX
-      {
-        char macStr[18]; macToStr(mk.b,macStr);
-        Serial.printf("[REC] mac=%s rssi=%d SAN=\"%s\" -> %s\n",
-                      macStr,(int)rssi, nameSan.c_str(),
-                      (devNum!=0xFFFF? String("dev "+String(devNum)).c_str() : "(no bind)"));
-      }
+      char macStr[18]; macToStr(mk.b,macStr);
+      if(devNum!=0xFFFF) Serial.printf("[REC] mac=%s rssi=%d SAN=\"%s\" -> dev %u\n",macStr,(int)rssi,nameSan.c_str(),(unsigned)devNum);
+      else               Serial.printf("[REC] mac=%s rssi=%d SAN=\"%s\" -> (no bind)\n",macStr,(int)rssi,nameSan.c_str());
 #endif
 
       if(devNum!=0xFFFF){
         RoomDevKey k{ src_room, devNum };
         auto it=bestRssi.find(k);
-        if(it==bestRssi.end() || rssi>it->second){
-          bestRssi[k]=rssi;
-          Serial.printf("[AGG] room=%u dev=%u rssi=%d\n",
-                        (unsigned)k.room, (unsigned)k.dev, (int)bestRssi[k]);
-        }
+        if(it==bestRssi.end() || rssi>it->second) bestRssi[k]=rssi;
       }
     }
   }
@@ -335,7 +379,7 @@ maybe_forward:
   }
 }
 
-// ---------- ICE UART ----------
+// ---------------- ICE UART ----------------
 static void pollICE(){
   while(Serial1.available()){
     uint8_t b=(uint8_t)Serial1.read();
@@ -351,7 +395,7 @@ static void pollICE(){
   }
 }
 
-// ---------- setup/loop ----------
+// ---------------- setup/loop ----------------
 void setup(){
   Serial.begin(115200); delay(50);
   if(!SPIFFS.begin(true)) Serial.println("SPIFFS mount failed");
@@ -362,12 +406,24 @@ void setup(){
   Serial1.begin(UART_BAUD_ICE, SERIAL_8N1, ICE_UART_RX, ICE_UART_TX);
   if(g_esn_on) esn_setup();
 }
+
 void loop(){
   pollICE();
   pollUsb();
-  static bool last_esn=false; static uint8_t last_ch=0;
-  if(last_esn!=g_esn_on || last_ch!=g_channel){
-    last_esn=g_esn_on; last_ch=g_channel;
-    esn_teardown(); esn_setup();
+  // Periodic timeout sweep even if no new fragments
+  if(reasmList.size()){
+    uint32_t now=millis();
+    for(size_t i=0;i<reasmList.size();++i){
+      ReasmBuf& rb=reasmList[i];
+      if(now-rb.last_ms>1500){
+        Serial.printf("[ESN-RX] timeout src_room=%u batch=%lu seq=%u missing={",
+                      (unsigned)rb.src_room,(unsigned long)rb.batch,(unsigned)rb.seq);
+        bool first=true; for(uint8_t j=0;j<rb.total;j++){ if(!rb.have[j]){ if(!first) Serial.print(','); Serial.print(j); first=false; } }
+        Serial.println("}");
+        reasmList.erase(reasmList.begin()+i); --i;
+      }
+    }
   }
+  static bool last_esn=false; static uint8_t last_ch=0;
+  if(last_esn!=g_esn_on || last_ch!=g_channel){ last_esn=g_esn_on; last_ch=g_channel; esn_teardown(); esn_setup(); }
 }
