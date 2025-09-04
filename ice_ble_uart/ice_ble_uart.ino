@@ -1,6 +1,5 @@
 /*
-  SMOKE Unified (ESP32-S3) — Receiver/Bridge v2.2 (room-aware, 2.x/3.x compatible)
-
+  SMOKE Unified (ESP32-S3) — Receiver/Bridge v2.1 (room-aware, portable ESP-NOW)
   - One firmware for all receivers (flash-and-go)
   - UART1 (GPIO16 RX, GPIO17 TX) COBS+CRC input from ICE
   - Name-based binding (sanitized ASCII prefix) and MAC binding
@@ -8,7 +7,7 @@
   - ESP-NOW relay with fragmentation/reassembly, chain ordering 1->2->3...
     * Accept frames if SRC_ROOM == myRoom (local) or SRC_ROOM == myRoom-1 (prev)
     * If tail==off: forward upstream; if tail==on: print compact summary
-  - Compact output at END_OF_SCAN:  room.device@rssi  (room comes from src_room)
+  - Compact output at END_OF_SCAN:  room.device@rssi
 */
 
 #include <Arduino.h>
@@ -17,13 +16,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
-
-// -------- Arduino-ESP32 version detection (2.x / 3.x) --------
-#include <esp_arduino_version.h>
-#ifndef ESP_ARDUINO_VERSION_MAJOR
-  // Fallback if the header isn't present (treat as 2.x)
-  #define ESP_ARDUINO_VERSION_MAJOR 2
-#endif
+#include <esp_idf_version.h>
 
 #include <map>
 #include <unordered_map>
@@ -31,7 +24,7 @@
 
 // ======================= CONFIG =======================
 #define VERBOSE_RX     1          // 1=print per-record RX lines (debug)
-#define ESN_DEBUG      1          // 1=show ESP-NOW TX/RX fragment logs
+#define ESN_DEBUG      1          // 1=show ESP-NOW TX/RX fragment logs, 0=quiet
 
 #define UART_BAUD_ICE  921600
 #define ICE_UART_RX    16
@@ -73,11 +66,18 @@ struct MacKey { uint8_t b[6]; bool operator==(const MacKey& o) const { for(int i
 struct MacHash { size_t operator()(const MacKey& k) const { uint32_t h=(k.b[0]<<24)^(k.b[1]<<16)^(k.b[2]<<8)^k.b[3]^(k.b[4]<<4)^k.b[5]; return h; } };
 
 static std::unordered_map<MacKey, uint16_t, MacHash> mac2dev; // MAC -> device#
+static std::map<uint16_t, String> devNames;
 static std::map<String, uint16_t> name2dev;                   // sanitized Name -> device#
 
 // --------- room-aware "best RSSI this scan" ---------
-struct RoomDevKey { uint8_t room; uint16_t dev; bool operator==(const RoomDevKey& o) const { return room==o.room && dev==o.dev; } };
-struct RoomDevHash { size_t operator()(const RoomDevKey& k) const { return ((size_t)k.room << 16) ^ (size_t)k.dev; } };
+struct RoomDevKey {
+  uint8_t  room;
+  uint16_t dev;
+  bool operator==(const RoomDevKey& o) const { return room==o.room && dev==o.dev; }
+};
+struct RoomDevHash {
+  size_t operator()(const RoomDevKey& k) const { return ((size_t)k.room << 16) ^ (size_t)k.dev; }
+};
 static std::unordered_map<RoomDevKey, int8_t, RoomDevHash> bestRssi;
 
 static std::vector<String> seenNames;                         // recent sanitized names
@@ -110,8 +110,8 @@ struct ReasmBuf {
   uint16_t seq;
   uint8_t  total;
   std::vector<bool>    have;
-  std::vector<uint16_t> frag_len;   // track length per fragment
-  std::vector<uint8_t> data;        // place-by-index backing buffer
+  std::vector<uint16_t> frag_len;        // per-frag sizes
+  std::vector<uint8_t> data;             // fixed slots: total*ESN_FRAG_DATA_MAX
   uint32_t last_ms;
 };
 static std::vector<ReasmBuf> reasmList;
@@ -129,7 +129,6 @@ static String sanitizePrefix(const String& in){
   String out; out.reserve(in.length());
   for (size_t i=0;i<in.length();++i){ uint8_t c=(uint8_t)in[i]; if (c<32 || c>126) break; out += (char)c; }
   out.trim();
-  // collapse spaces
   String collapsed; collapsed.reserve(out.length()); bool lastSpace=false;
   for (size_t i=0;i<out.length(); ++i){ char c=out[i]; if (c==' '||c=='\t'){ if(!lastSpace){ collapsed+=' '; lastSpace=true; } } else { collapsed+=c; lastSpace=false; } }
   return collapsed;
@@ -254,10 +253,10 @@ static void pollUsb(){
   }
 }
 
-// forward declaration for lambda
+// forward declaration
 void processDecodedMessage(const uint8_t* m, size_t n, uint8_t src_room, bool from_esn);
 
-// =================== ESPNOW LAYER ===================
+// =================== ESPNOW LAYER (PORTABLE) ===================
 static bool esnInited = false;
 
 static void esn_teardown(){
@@ -281,92 +280,21 @@ static bool esn_setup(){
   }
   esnInited = true;
 
+  // broadcast peer
   esp_now_peer_info_t peer{};
   memcpy(peer.peer_addr, ESN_BROADCAST, 6);
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
   peer.channel = g_channel;
   peer.encrypt = false;
-#endif
   esp_now_add_peer(&peer);
 
-  // --------- RX callback (version-dependent signature) ---------
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-  // Arduino-ESP32 3.x
+  // ----------- RECV callback: IDF5 vs IDF4 signatures -----------
+#if ESP_IDF_VERSION_MAJOR >= 5
   esp_now_register_recv_cb([](const esp_now_recv_info_t* info, const uint8_t* data, int len){
     (void)info;
-    if (len < (int)sizeof(EsnFrag)) return;
-    const EsnFrag* h = (const EsnFrag*)data;
-    if (h->magic0!='S' || h->magic1!='M' || h->ver!=1) return;
-    if ((int)sizeof(EsnFrag) + (int)h->frag_len > len) return;
-
-#if ESN_DEBUG
-    Serial.printf("[ESN-RX] src_room=%u idx=%u/%u frag=%u bytes\n",
-                  (unsigned)h->src_room, (unsigned)h->index,
-                  (unsigned)h->total, (unsigned)h->frag_len);
-#endif
-
-    if (!(h->src_room == g_room || h->src_room == (uint8_t)(g_room-1))) return;
-
-    uint32_t now = millis();
-    int slot = -1;
-    for (size_t i=0;i<reasmList.size();++i){
-      ReasmBuf& rb = reasmList[i];
-      if (rb.src_room==h->src_room && rb.batch==h->batch && rb.seq==h->seq && memcmp(rb.origin,h->origin,6)==0){ slot=(int)i; break; }
-      if (now - rb.last_ms > 3000) { reasmList.erase(reasmList.begin()+i); --i; }
-    }
-    if (slot<0){
-      ReasmBuf rb{};
-      rb.src_room = h->src_room;
-      memcpy(rb.origin, h->origin, 6);
-      rb.batch = h->batch; rb.seq = h->seq;
-      rb.total = h->total;
-      rb.have.assign(h->total, false);
-      rb.frag_len.assign(h->total, 0);
-      rb.data.assign((size_t)h->total * (size_t)ESN_FRAG_DATA_MAX, 0);
-      rb.last_ms = now;
-      reasmList.push_back(rb);
-      slot = (int)reasmList.size()-1;
-    }
-    ReasmBuf& rb = reasmList[slot];
-    if (h->index >= rb.total) return;
-    if (!rb.have[h->index]){
-      rb.have[h->index] = true;
-      rb.frag_len[h->index] = h->frag_len;
-      size_t off = (size_t)h->index * (size_t)ESN_FRAG_DATA_MAX;
-      memcpy(&rb.data[off], h->data, h->frag_len);
-      rb.last_ms = now;
-    }
-    bool complete = true;
-    for (bool b : rb.have) if (!b) { complete = false; break; }
-    if (complete){
-      size_t total_len=0; for(uint8_t i=0;i<rb.total;i++) total_len += rb.frag_len[i];
-      std::vector<uint8_t> msg; msg.reserve(total_len);
-      for(uint8_t i=0;i<rb.total;i++){
-        size_t off=(size_t)i*(size_t)ESN_FRAG_DATA_MAX;
-        msg.insert(msg.end(), rb.data.begin()+off, rb.data.begin()+off+rb.frag_len[i]);
-      }
-
-      SeenKey sk{}; memcpy(sk.origin, rb.origin, 6); sk.batch=rb.batch; sk.seq=rb.seq; sk.src_room=rb.src_room;
-      bool duplicate=false;
-      for (auto &k : seenCache){
-        if (k.src_room==sk.src_room && k.batch==sk.batch && k.seq==sk.seq && memcmp(k.origin,sk.origin,6)==0){ duplicate=true; break; }
-      }
-
-      Serial.printf("[ESN-RX] complete src_room=%u bytes=%u%s\n",
-                    (unsigned)rb.src_room, (unsigned)msg.size(), duplicate?" (duplicate)":"");
-
-      if (!duplicate){
-        if (seenCache.size() >= SEEN_CACHE_MAX) seenCache.erase(seenCache.begin());
-        seenCache.push_back(sk);
-        processDecodedMessage(msg.data(), msg.size(), rb.src_room, true);
-      }
-      reasmList.erase(reasmList.begin()+slot);
-    }
-  });
 #else
-  // Arduino-ESP32 2.x
-  esp_now_register_recv_cb([](uint8_t* mac, const uint8_t* data, int len){
+  esp_now_register_recv_cb([](const uint8_t* mac, const uint8_t* data, int len){
     (void)mac;
+#endif
     if (len < (int)sizeof(EsnFrag)) return;
     const EsnFrag* h = (const EsnFrag*)data;
     if (h->magic0!='S' || h->magic1!='M' || h->ver!=1) return;
@@ -378,6 +306,7 @@ static bool esn_setup(){
                   (unsigned)h->total, (unsigned)h->frag_len);
 #endif
 
+    // Accept only local room or previous room
     if (!(h->src_room == g_room || h->src_room == (uint8_t)(g_room-1))) return;
 
     uint32_t now = millis();
@@ -403,8 +332,8 @@ static bool esn_setup(){
     ReasmBuf& rb = reasmList[slot];
     if (h->index >= rb.total) return;
     if (!rb.have[h->index]){
-      rb.have[h->index] = true;
-      rb.frag_len[h->index] = h->frag_len;
+      rb.have[h->index]   = true;
+      rb.frag_len[h->index]= h->frag_len;
       size_t off = (size_t)h->index * (size_t)ESN_FRAG_DATA_MAX;
       memcpy(&rb.data[off], h->data, h->frag_len);
       rb.last_ms = now;
@@ -419,14 +348,17 @@ static bool esn_setup(){
         msg.insert(msg.end(), rb.data.begin()+off, rb.data.begin()+off+rb.frag_len[i]);
       }
 
+      // Dedup (origin,batch,seq,src_room)
       SeenKey sk{}; memcpy(sk.origin, rb.origin, 6); sk.batch=rb.batch; sk.seq=rb.seq; sk.src_room=rb.src_room;
       bool duplicate=false;
       for (auto &k : seenCache){
         if (k.src_room==sk.src_room && k.batch==sk.batch && k.seq==sk.seq && memcmp(k.origin,sk.origin,6)==0){ duplicate=true; break; }
       }
 
+#if ESN_DEBUG
       Serial.printf("[ESN-RX] complete src_room=%u bytes=%u%s\n",
                     (unsigned)rb.src_room, (unsigned)msg.size(), duplicate?" (duplicate)":"");
+#endif
 
       if (!duplicate){
         if (seenCache.size() >= SEEN_CACHE_MAX) seenCache.erase(seenCache.begin());
@@ -436,27 +368,14 @@ static bool esn_setup(){
       reasmList.erase(reasmList.begin()+slot);
     }
   });
-#endif
 
-  // --------- SEND callback (version-dependent) ---------
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-  esp_now_register_send_cb([](const esp_now_send_info_t* info, esp_now_send_status_t status){
+  // ----------- SEND callback: portable (status only) -----------
+  esp_now_register_send_cb([](const uint8_t* mac, esp_now_send_status_t status){
 #if ESN_DEBUG
-    Serial.printf("[ESN-SENT] dst=%02X:%02X:%02X:%02X:%02X:%02X ch=%u status=%s\n",
-      info->dest_addr[0], info->dest_addr[1], info->dest_addr[2],
-      info->dest_addr[3], info->dest_addr[4], info->dest_addr[5],
-      info->channel, status==ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+    (void)mac;
+    Serial.printf("[ESN-TX] status=%s\n", status==ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
 #endif
   });
-#else
-  esp_now_register_send_cb([](uint8_t* mac, esp_now_send_status_t status){
-#if ESN_DEBUG
-    Serial.printf("[ESN-SENT] dst=%02X:%02X:%02X:%02X:%02X:%02X status=%s\n",
-      mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-      status==ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
-#endif
-  });
-#endif
 
   return true;
 }
@@ -544,10 +463,8 @@ void processDecodedMessage(const uint8_t* m, size_t n, uint8_t src_room, bool /*
   if (n < 1+1+6+4+2+2+2) return;
   uint16_t given=(uint16_t)m[n-2] | ((uint16_t)m[n-1]<<8);
   uint16_t calc =crc16_ccitt(m, n-2);
-  if (given!=calc) {
-#if ESN_DEBUG
+  if (given!=calc){
     Serial.printf("[PARSE] CRC FAIL len=%u given=0x%04X calc=0x%04X\n",(unsigned)n,(unsigned)given,(unsigned)calc);
-#endif
     return;
   }
 
@@ -556,9 +473,7 @@ void processDecodedMessage(const uint8_t* m, size_t n, uint8_t src_room, bool /*
   uint16_t seq   = (uint16_t)m[12] | ((uint16_t)m[13]<<8);
   uint8_t  typ   = m[1];
 
-#if ESN_DEBUG
   Serial.printf("[PARSE] OK typ=%u src_room=%u batch=%lu seq=%u\n",(unsigned)typ,(unsigned)src_room,(unsigned long)batch,(unsigned)seq);
-#endif
 
   // Dedup cache
   SeenKey sk{}; memcpy(sk.origin, origin, 6); sk.batch=batch; sk.seq=seq; sk.src_room=src_room;
@@ -574,24 +489,31 @@ void processDecodedMessage(const uint8_t* m, size_t n, uint8_t src_room, bool /*
     endOfScanFlush(src_room);
   } else {
     uint16_t count = (uint16_t)m[14] | ((uint16_t)m[15]<<8);
-#if ESN_DEBUG
     Serial.printf("[PARSE] count=%u\n",(unsigned)count);
-#endif
     size_t p = 1+1+6+4+2+2;
     size_t end = n-2;
 
     for (uint16_t i=0; i<count && p+2<=end; ++i){
       // T1 MAC
-      if (p+2>end) break; uint8_t T=m[p++], L=m[p++]; if(!(T==1 && L==6) || p+6>end) break;
+      uint8_t T=m[p++], L=m[p++];
+      if(!(T==1 && L==6) || p+6>end){ Serial.printf("[PARSE] rec%u bad T1/L1\n",(unsigned)i); break; }
       MacKey mk; memcpy(mk.b, &m[p], 6); p+=6;
+
       // T2 RSSI
-      if (p+2>end) break; T=m[p++]; L=m[p++]; if(!(T==2 && L==1) || p+1>end) break;
+      if (p+2>end){ Serial.printf("[PARSE] rec%u missing T2\n",(unsigned)i); break; }
+      T=m[p++]; L=m[p++]; if(!(T==2 && L==1) || p+1>end){ Serial.printf("[PARSE] rec%u bad T2/L2\n",(unsigned)i); break; }
       int8_t rssi=(int8_t)m[p++];
+
       // T3 FLAGS
-      if (p+2>end) break; T=m[p++]; L=m[p++]; if(!(T==3 && L==1) || p+1>end) break; p++;
+      if (p+2>end){ Serial.printf("[PARSE] rec%u missing T3\n",(unsigned)i); break; }
+      T=m[p++]; L=m[p++]; if(!(T==3 && L==1) || p+1>end){ Serial.printf("[PARSE] rec%u bad T3/L3\n",(unsigned)i); break; }
+      p++; // flags
+
       // T4 NAME (optional)
       String nameRaw, nameSan;
-      if (p+2<=end && m[p]==4){ T=m[p++]; L=m[p++]; if(p+L<=end){ nameRaw = String((const char*)&m[p], L); p+=L; } }
+      if (p+2<=end && m[p]==4){
+        T=m[p++]; L=m[p++]; if(p+L<=end){ nameRaw = String((const char*)&m[p], L); p+=L; }
+      }
       if (nameRaw.length()) { nameSan = sanitizePrefix(nameRaw); addSeen(nameSan); }
 
       // choose device number
@@ -628,7 +550,7 @@ void processDecodedMessage(const uint8_t* m, size_t n, uint8_t src_room, bool /*
 
 maybe_forward:
   if (g_esn_on && !g_is_tail && (src_room == g_room || src_room == (uint8_t)(g_room-1))) {
-    forward_upstream(src_room, m, n, origin, batch, seq);
+    forward_upstream(src_room, m, n, &m[2], (uint32_t)m[8] | ((uint32_t)m[9]<<8) | ((uint32_t)m[10]<<16) | ((uint32_t)m[11]<<24), (uint16_t)m[12] | ((uint16_t)m[13]<<8));
   }
 }
 
