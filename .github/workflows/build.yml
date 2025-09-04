@@ -24,19 +24,17 @@ jobs:
       - name: Set up Arduino CLI
         uses: arduino/setup-arduino-cli@v1
 
-      - name: Install ESP32 core & tools
+      - name: Install ESP32 core & tools (pinned)
         run: |
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32
+          arduino-cli core install esp32:esp32@3.3.0
           sudo apt-get update
           sudo apt-get install -y jq zip
 
-      # NEW: required libraries
-      - name: Install required Arduino libraries
+      - name: Install required Arduino libraries (pinned)
         run: |
           arduino-cli lib update-index
-          # Pin if you want a specific version, e.g. "NimBLE-Arduino@1.4.1"
-          arduino-cli lib install "NimBLE-Arduino"
+          arduino-cli lib install "NimBLE-Arduino@1.4.1"
 
       - name: Compile & bundle ${{ matrix.t.name }}
         env:
@@ -45,29 +43,41 @@ jobs:
           NAME:       ${{ matrix.t.name }}
         run: |
           set -e
+
+          # Build
           arduino-cli compile --fqbn "$FQBN" --export-binaries "$SKETCH_DIR"
+
+          # Locate build folder Arduino CLI used
           BUILD="$(arduino-cli compile --fqbn "$FQBN" --show-properties "$SKETCH_DIR" | sed -n 's/^build.path=//p' | tail -n1)"
+
+          # Collect outputs
           mkdir -p out/$NAME
           APP="$(ls "$BUILD"/*.ino.bin 2>/dev/null | head -n1)"
           PART="$(ls "$BUILD"/*partitions.bin 2>/dev/null | head -n1)"
           BOOT="$(ls "$BUILD"/*.bootloader.bin 2>/dev/null | head -n1 || true)"
           if [ -z "$BOOT" ]; then BOOT="$(find "$BUILD" -name 'bootloader*.bin' -print -quit)"; fi
+
+          # boot_app0 comes from the installed esp32 core package
           DATA_DIR="$(arduino-cli config dump --format json | jq -r '.directories.data')"
           APP0="$(find "$DATA_DIR/packages/esp32" -type f -name 'boot_app0.bin' -print -quit)"
+
           : "${APP:?app .ino.bin not found}"
           : "${PART:?partitions.bin not found}"
           : "${BOOT:?bootloader.bin not found}"
           : "${APP0:?boot_app0.bin not found}"
+
           cp "$APP"  out/$NAME/firmware.bin
           cp "$PART" out/$NAME/partitions.bin
           cp "$BOOT" out/$NAME/bootloader.bin
           cp "$APP0" out/$NAME/boot_app0.bin
+
           cat > out/$NAME/flash_offsets.txt <<'EOF'
           bootloader.bin  0x0000
           partitions.bin  0x8000
           boot_app0.bin   0xE000
           firmware.bin    0x10000
           EOF
+
           (cd out/$NAME && zip -9 ../"${NAME}_bins".zip bootloader.bin partitions.bin boot_app0.bin firmware.bin flash_offsets.txt)
 
       - uses: actions/upload-artifact@v4
