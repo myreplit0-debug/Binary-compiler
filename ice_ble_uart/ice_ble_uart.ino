@@ -1,21 +1,15 @@
 /*
-  SMOKE v3 — Room Chain (ESP32-S3)  (patched for strongest-per-scan winners)
+  SMOKE v3 — Room Chain (ESP32-S3)  (strongest-per-scan, multi-room winners)
 
   - UART1 (GPIO16 RX, GPIO17 TX)
-    * If NOT tail: read "NAME@RSSI" lines from ICE and track best per device id
-    * If tail: write final results to UART1 for the UI
+    * Non-tail: read "NAME@RSSI" lines from ICE and track best per device id
+    * Tail: write final results to UART1 for the UI
   - ESP-NOW compact binary chain: strongest-per-device bubbles up 1->2->3...
   - Strongest-per-scan is enforced via batch id:
-      • A “batch” starts at Room 1 on ICE “END” (or timeout) and increments g_batch
-      • Rooms 2..N reset their per-scan table when they see a new batch id
-      • Tail prints exactly once per batch when the last fragment for that batch arrives
-  - Timing-safe forwarding (slot delay per room).
-
-  Packet (binary, little endian):
-    Header:
-      'S','M',2, src_room, total, index, count(1B), batch(4B)
-    Entries (repeated count times):
-      dev(2B), rssi(1B signed), room(1B)
+      • Batch starts at Room 1 on ICE “END” (or timeout) and increments g_batch
+      • Rooms 2..N reset per-scan tables when they see a new batch id
+      • Tail prints once per batch when the last fragment for that batch arrives
+  - Slot delay per room to reduce collisions
 */
 
 #include <Arduino.h>
@@ -28,6 +22,7 @@
 #include <map>
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
 
 // ======================= CONFIG =======================
 #define UART_BAUD_UI_ICE 921600
@@ -46,7 +41,7 @@
 
 // ======================= STATE ========================
 static uint8_t  g_room    = 1;     // 1..255
-static bool     g_is_tail = false; // tail -> prints final to USB+UART1, doesn’t forward
+static bool     g_is_tail = false; // tail -> prints final, doesn’t forward
 static bool     g_esn_on  = true;
 static uint8_t  g_channel = 6;
 
@@ -58,8 +53,8 @@ static bool DBG_NAMES = true;
 // Batch id (originates in room 1 on each ICE “END”)
 static uint32_t g_batch  = 1;
 
-// RX-side batch tracking at *every* room (for reset/print gating)
-static uint32_t g_rx_batch = 0;     // current batch we’re accumulating
+// RX-side batch tracking (for reset/print gating)
+static uint32_t g_rx_batch  = 0;   // current batch we’re accumulating
 static bool     g_rx_printed = false; // tail: printed winners for g_rx_batch
 
 // ===================== DATA STRUCTS ====================
@@ -130,7 +125,7 @@ static String sanitizePrefix(const String& in){
   String collapsed; collapsed.reserve(out.length()); bool lastSpace=false;
   for (size_t i=0;i<out.length(); ++i){
     char c=out[i];
-    if (c==' '||c=='\t'){ if(!lastSpace){ collapsed+=' '; lastSpace=true; } }
+    if (c==' '||c=='t'){ if(!lastSpace){ collapsed+=' '; lastSpace=true; } }
     else { collapsed+=c; lastSpace=false; }
   }
   return collapsed;
@@ -267,25 +262,9 @@ static void esn_teardown(){
   esnInited=false;
 }
 
-static void esn_send_entries(const std::vector<struct Entry>& vec, uint32_t batch){
-  if (!esnInited) return;
-  const size_t perFrag = (ESN_FRAG_DATA_MAX) / sizeof(Entry);
-  uint8_t total = (uint8_t)((vec.size() + perFrag - 1) / perFrag); if (!total) total=1;
-  for (uint8_t idx=0; idx<total; ++idx){
-    size_t off = (size_t)idx * perFrag;
-    size_t take = std::min(perFrag, vec.size() - off);
-    uint8_t buf[sizeof(EsnHdr) + ESN_FRAG_DATA_MAX];
-    EsnHdr* h = (EsnHdr*)buf;
-    h->magic0='S'; h->magic1='M'; h->ver=2; h->src_room=g_room;
-    h->total=total; h->index=idx; h->count=(uint8_t)take; h->batch=batch;
-    memcpy(buf+sizeof(EsnHdr), &vec[off], take*sizeof(Entry));
-    size_t bytes = sizeof(EsnHdr) + take*sizeof(Entry);
-    dumpHex("[ESN-TX] frag", buf, bytes);
-    // slot delay before each frag to spread airtime by room index
-    delay((unsigned long)SLOT_MS * (unsigned long)g_room);
-    esp_now_send(ESN_BROADCAST, buf, bytes);
-  }
-}
+// forward decl
+struct Entry;
+static void esn_send_entries(const std::vector<struct Entry>& vec, uint32_t batch);
 
 static bool esn_setup(){
   if(!g_esn_on){ esn_teardown(); return false; }
@@ -315,13 +294,14 @@ static bool esn_setup(){
     // Only accept from previous room or self (rebroadcast)
     if (!(h->src_room==g_room || h->src_room==(uint8_t)(g_room-1))) return;
 
-    // New batch? reset local winners
+    // New batch? reset winners AND this room's localBest (patch)
     if (g_rx_batch != h->batch){
       if (DBG_PARSE) Serial.printf("[RX] new batch=%lu (was %lu) -> reset winners\n",
                                    (unsigned long)h->batch, (unsigned long)g_rx_batch);
-      g_rx_batch  = h->batch;
-      g_rx_printed= false;      // tail gate
+      g_rx_batch   = h->batch;
+      g_rx_printed = false;
       chainBest.clear();
+      localBest.clear();              // <-- important: reset this room’s scan cache
     }
 
     // hex dump fragment
@@ -333,7 +313,7 @@ static bool esn_setup(){
 
     const Entry* ents = (const Entry*)(data + sizeof(EsnHdr));
 
-    // Merge into winners-for-this-batch: keep strongest RSSI
+    // Merge into winners-for-this-batch: keep strongest RSSI (propagated sources)
     for (uint8_t i=0;i<h->count;i++){
       uint16_t dev = ents[i].dev; int8_t rssi = ents[i].rssi; uint8_t room = ents[i].room;
       auto it = chainBest.find(dev);
@@ -342,15 +322,27 @@ static bool esn_setup(){
       }
     }
 
-    // If this is the last fragment of the batch we saw, decide action
+    // On last fragment: merge this room's own localBest, then forward or print
     if (h->index == h->total - 1){
       if (!g_is_tail){
-        // Forward once per batch (we just merged all fragments we received so far)
-        // Delay by room slots to avoid collisions
+        // (1) fold localBest into chainBest for this *batch*
+        for (auto &kv : localBest){
+          uint16_t dev  = kv.first;
+          int8_t   rssi = kv.second;
+          auto it = chainBest.find(dev);
+          if (it == chainBest.end() || rssi > it->second.rssi){
+            chainBest[dev] = { rssi, g_room };   // tag with THIS room
+          }
+        }
+
+        // (2) forward once per batch
         delay((unsigned long)SLOT_MS * (unsigned long)g_room + MERGE_DELAY_MS);
         std::vector<Entry> all; all.reserve(chainBest.size());
         for (auto &kv : chainBest) all.push_back(Entry{ kv.first, kv.second.rssi, kv.second.room });
         esn_send_entries(all, g_rx_batch);
+
+        // (3) clear for next batch window
+        localBest.clear();
       } else {
         // Tail prints exactly once per batch on the last fragment
         if (!g_rx_printed){
@@ -369,13 +361,34 @@ static bool esn_setup(){
   return true;
 }
 
+// helper to TX one vector of entries with a given batch id
+static void esn_send_entries(const std::vector<Entry>& vec, uint32_t batch){
+  if (!esnInited) return;
+  const size_t perFrag = (ESN_FRAG_DATA_MAX) / sizeof(Entry);
+  uint8_t total = (uint8_t)((vec.size() + perFrag - 1) / perFrag); if (!total) total=1;
+  for (uint8_t idx=0; idx<total; ++idx){
+    size_t off  = (size_t)idx * perFrag;
+    size_t take = std::min(perFrag, vec.size() - off);
+    uint8_t buf[sizeof(EsnHdr) + ESN_FRAG_DATA_MAX];
+    EsnHdr* h = (EsnHdr*)buf;
+    h->magic0='S'; h->magic1='M'; h->ver=2; h->src_room=g_room;
+    h->total=total; h->index=idx; h->count=(uint8_t)take; h->batch=batch;
+    memcpy(buf+sizeof(EsnHdr), &vec[off], take*sizeof(Entry));
+    size_t bytes = sizeof(EsnHdr) + take*sizeof(Entry);
+    dumpHex("[ESN-TX] frag", buf, bytes);
+    // slot delay before each frag to spread airtime by room index
+    delay((unsigned long)SLOT_MS * (unsigned long)g_room);
+    esp_now_send(ESN_BROADCAST, buf, bytes);
+  }
+}
+
 // =================== UART (ICE or UI) ==================
 static uint32_t lastLineMs = 0;
 
 static void startNewBatchIfRoom1(){
   if (g_room==1){
     g_batch++;
-    chainBest.clear();  // start fresh winners for new scan
+    chainBest.clear();  // winners reset for the new scan
     if (DBG_PARSE) Serial.printf("[BATCH] start %lu\n", (unsigned long)g_batch);
   }
 }
